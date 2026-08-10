@@ -51,6 +51,24 @@ cp "$SETUP_DIR/setup-portal-update-check.service" /etc/systemd/system/setup-port
 cp "$SETUP_DIR/setup-portal-update-check.timer" /etc/systemd/system/setup-portal-update-check.timer
 
 # ---------------------------------------------------------------------------
+# Migration: ein "pi-setup-portal.service" (Name VOR der Umbenennung in
+# "setup-portal", siehe Warnhinweis in setup_portal.py) blockiert sonst
+# weiterhin Port 80, waehrend der neue Dienst gleich unten auf einen
+# Ausweichport ausweicht - live so aufgefallen. Eigene VPN-Screenshots und
+# die Auto-Update-Einstellung je App werden dabei mitgenommen statt
+# geloescht, bevor der alte Ordner entfernt wird.
+if [ -e /etc/systemd/system/pi-setup-portal.service ]; then
+    log "Alte 'pi-setup-portal.service' (vor der Umbenennung in 'setup-portal') ablösen"
+    systemctl disable --now pi-setup-portal.service 2>/dev/null || true
+    rm -f /etc/systemd/system/pi-setup-portal.service /etc/default/pi-setup-portal
+fi
+if [ -d /opt/pi-setup-portal ]; then
+    cp -rn /opt/pi-setup-portal/hilfe-bilder/. /opt/setup-portal/hilfe-bilder/ 2>/dev/null || true
+    cp -rn /opt/pi-setup-portal/state/. /opt/setup-portal/state/ 2>/dev/null || true
+    rm -rf /opt/pi-setup-portal
+fi
+
+# ---------------------------------------------------------------------------
 log "Pruefe Port 80"
 # Koennte von einem bereits laufenden Webserver (z. B. Linux-Server-Fall)
 # belegt sein - dann auf einen Ausweich-Port wechseln, statt den
