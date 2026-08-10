@@ -1,0 +1,19 @@
+# Teil des Repos "setup-portal" (siehe Warnhinweis in setup_portal.py).
+[Unit]
+Description=Setup-Portal – Setup-Seite inkl. WLAN-Einstellungen, Backup und Update fuer alle registrierten Apps (Port 80)
+After=NetworkManager.service
+Wants=NetworkManager.service
+# Bewusst KEIN Before=<app>.service: jede registrierte App soll unabhaengig
+# davon sofort starten, auch wenn WLAN nie eingerichtet wird (reine Kabelnutzung).
+
+[Service]
+Type=simple
+# Nur vorhanden, falls Port 80 beim Einrichten schon belegt war - setzt dann
+# SETUP_PORTAL_LANDING_PORT auf einen Ausweich-Port.
+EnvironmentFile=-/etc/default/setup-portal
+ExecStart=/opt/setup-portal/setup-portal.sh
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
