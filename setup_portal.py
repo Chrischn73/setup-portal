@@ -102,7 +102,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote
 
-PORTAL_VERSION = "1.8.3"
+PORTAL_VERSION = "1.8.4"
 
 PORTAL_DIR = "/opt/setup-portal"
 # Jede App legt hier per eigenem install.sh genau eine Datei <app-id>.json
@@ -692,7 +692,7 @@ PAGE_DOWNLOAD_SELECT = """<!doctype html>
   </select>
   <button type="submit">⬇ Backup herunterladen</button>
 </form>
-<a class="btn" href="/backup">← Zurück zu den Backups</a>
+<a class="btn" href="/backup">← Zurück</a>
 </body></html>
 """
 
