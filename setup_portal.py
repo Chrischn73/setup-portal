@@ -63,13 +63,19 @@ kein Foto-Handling, nichts), es kennt nur das generische Schema.
   und fuehrt dessen setup/install.sh aus (siehe _run_companion_install_in_
   background). Rein deklarativ: dieses Skript kennt auch dabei keine
   App-Namen, nur was im "companion"-Objekt steht.
-- /update: zusaetzlich pro App ein Button "Komplett-Installation erneut
-  ausfuehren" (siehe _run_install_script_in_background) - ein normales, file_map-
+- /update: zusaetzlich pro App ein Button "Komplett von GitHub
+  aktualisieren" (siehe _run_install_script_in_background) - ein normales, file_map-
   basiertes Update kopiert nur App-eigene Dateien, NIE install.sh-eigene
   Aenderungen (Boot-Bildschirm, apps.d-Descriptor-Felder der jeweiligen App).
   Erspart dafuer den manuellen SSH-Login. Betrifft NICHT den Portal-Code
   selbst - der aktualisiert sich unabhaengig davon selbst, siehe naechster
   Punkt.
+- /update: ausserdem eine eigene Karte "Setup-Portal selbst" mit einem
+  Button, der den taeglichen Selbst-Update-Check manuell sofort anstoesst
+  (siehe trigger_self_update_check()) - ueber den unabhaengigen systemd-
+  Dienst (systemctl start --no-block), NICHT als Thread im laufenden
+  Webserver-Prozess, aus demselben Sicherheitsgrund wie bei --self-update
+  unten.
 - CLI --self-update (siehe setup-portal-update-check.timer, taeglich):
   prueft das eigene GitHub-Repo (SELF_UPDATE_GITHUB_REPO) auf ein neueres
   Release und aktualisiert sich bei Bedarf selbst. Bewusst NUR per Timer/
@@ -96,7 +102,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote
 
-PORTAL_VERSION = "1.7.1"
+PORTAL_VERSION = "1.8.0"
 
 PORTAL_DIR = "/opt/setup-portal"
 # Jede App legt hier per eigenem install.sh genau eine Datei <app-id>.json
@@ -702,6 +708,7 @@ PAGE_UPDATE = """<!doctype html>
 {message}
 {app_sections}
 {all_update_button}
+{self_update_card}
 <a class="btn" href="/">← Zurück zur Übersicht</a>
 
 <div id="update-modal" class="modal-backdrop">
@@ -1769,6 +1776,32 @@ def _self_update():
     subprocess.run(["systemctl", "restart", "setup-portal.service"], capture_output=True, text=True)
 
 
+def trigger_self_update_check():
+    """Stoesst den taeglichen Selbst-Update-Check des Portals manuell sofort
+    an, fuer den "Jetzt auf neue Version pruefen"-Button auf /update. Laeuft
+    ueber den eigenen, unabhaengigen systemd-Dienst (systemctl start),
+    NICHT als Thread im laufenden Webserver-Prozess - _self_update() kann
+    "systemctl restart setup-portal.service" ausloesen, und das aus einem
+    Anfrage-Thread DESSELBEN Dienstes heraus zu tun waere fragil (der
+    Thread stirbt mit dem Neustart, siehe Docstring dort). "--no-block"
+    laesst systemctl sofort zurueckkehren, statt auf den Abschluss des
+    Oneshot-Dienstes zu warten - der eigentliche Check/Update laeuft dann
+    unabhaengig im Hintergrund weiter, auch wenn dieser Request schon
+    lange beantwortet ist."""
+    try:
+        result = subprocess.run(
+            ["systemctl", "start", "--no-block", "setup-portal-update-check.service"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return False, f"Konnte die Prüfung nicht starten: {e}"
+    if result.returncode != 0:
+        return False, (result.stderr or result.stdout or "Unbekannter Fehler").strip()
+    return True, ("Prüfung gestartet. Falls eine neue Version gefunden wird, aktualisiert sich das Portal "
+                   "automatisch im Hintergrund - diese Seite ist dann für ein paar Sekunden nicht erreichbar, "
+                   "während der Dienst neu startet.")
+
+
 def fetch_latest_release(app):
     return _fetch_latest_release_for_repo(app["update"]["github_repo"])
 
@@ -2158,12 +2191,26 @@ werden dabei ausgeschaltet, falls es ein Rueckschritt ist):</p>
 <p class="muted" style="font-size:.85rem; margin-top:1rem;">Ein normales Update kopiert nur die
 App-eigenen Dateien - Änderungen an <code>install.sh</code> selbst (z. B. neue Setup-Funktionen,
 Descriptor-Änderungen) werden dabei NICHT übernommen. Falls nötig, hier ohne SSH nachholen:</p>
-<button type="button" class="btn-small" onclick="return startInstallRun('{app_id}')">🔧 Komplett-Installation erneut ausführen</button>
+<button type="button" class="btn-small" onclick="return startInstallRun('{app_id}')">🔄 Komplett von GitHub aktualisieren</button>
 {changelog_block}
 </div>"""
 
 
-def render_update_overview(message=""):
+def render_self_update_card(message=""):
+    return f"""
+<div class="msg app-section">
+<h2>🔧 Setup-Portal-Update</h2>
+<p class="muted">Version {PORTAL_VERSION}. Aktualisiert sich taeglich automatisch (02:30 Uhr) direkt aus den
+GitHub-Releases von <code>{html.escape(SELF_UPDATE_GITHUB_REPO)}</code> - unabhaengig von den Apps oben.</p>
+{message}
+<form method="post" action="/update/self-update-check"
+      onsubmit="return confirm('Jetzt auf eine neue Portal-Version prüfen? Falls eine gefunden wird, startet der Dienst kurz neu - diese Seite ist dann kurz nicht erreichbar.')">
+  <button type="submit" class="btn-small">🔄 Jetzt auf neue Version prüfen</button>
+</form>
+</div>"""
+
+
+def render_update_overview(message="", self_update_message=""):
     apps = load_apps()
     if not apps:
         app_sections = '<p class="muted">Keine Anwendung registriert.</p>'
@@ -2180,6 +2227,7 @@ def render_update_overview(message=""):
         message=message,
         app_sections=app_sections,
         all_update_button=all_update_button,
+        self_update_card=render_self_update_card(self_update_message),
     )
 
 
@@ -2649,6 +2697,11 @@ class BaseHandler(BaseHTTPRequestHandler):
             ok, detail = set_auto_update(app["id"], enabled)
             msg = (f'<div class="msg ok">✅ {detail}</div>' if ok else f'<div class="msg err">{detail}</div>')
             self._send_html(render_update_overview(msg))
+            return
+        if path == "/update/self-update-check":
+            ok, detail = trigger_self_update_check()
+            msg = (f'<div class="msg ok">✅ {detail}</div>' if ok else f'<div class="msg err">{detail}</div>')
+            self._send_html(render_update_overview(self_update_message=msg))
             return
 
         if path in ("/wifi/connect", "/wifi/disconnect") and not IS_PI:
