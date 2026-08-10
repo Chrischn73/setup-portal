@@ -102,7 +102,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote
 
-PORTAL_VERSION = "1.8.0"
+PORTAL_VERSION = "1.8.1"
 
 PORTAL_DIR = "/opt/setup-portal"
 # Jede App legt hier per eigenem install.sh genau eine Datei <app-id>.json
@@ -797,6 +797,35 @@ function updateVersionSwitchButton(select, appId) {{
 document.querySelectorAll('select[data-app-id]').forEach(function(sel) {{
   updateVersionSwitchButton(sel, sel.dataset.appId);
 }});
+function selfUpdatePoll(content, modal) {{
+  fetch('/update/self-update-check/status').then(r => r.json()).then(function(d) {{
+    if (!d.done) {{ setTimeout(function() {{ selfUpdatePoll(content, modal); }}, 2000); return; }}
+    content.innerHTML = d.ok
+      ? '<div class="msg ok">✅ ' + d.detail + '</div>'
+      : '<div class="msg err">❌ ' + (d.detail || 'Fehler.') + '</div>';
+    setTimeout(function() {{ window.location.reload(); }}, 2500);
+  }}).catch(function() {{ setTimeout(function() {{ selfUpdatePoll(content, modal); }}, 2000); }});
+}}
+function startSelfUpdateCheck() {{
+  if (!confirm('Jetzt auf eine neue Portal-Version prüfen? Falls eine gefunden wird, startet der Dienst kurz neu - diese Seite ist dann kurz nicht erreichbar.')) {{
+    return false;
+  }}
+  var modal = document.getElementById('update-modal');
+  var content = document.getElementById('update-modal-content');
+  content.innerHTML = '<h1>""" + SPINNER_SVG + """Prüfe auf neue Version…</h1>' +
+    '<p class="muted">Das kann bis zu einer Minute dauern.</p>';
+  modal.classList.add('show');
+  fetch('/update/self-update-check', {{method: 'POST'}}).then(r => r.json()).then(function(d) {{
+    if (!d.started) {{
+      content.innerHTML = '<div class="msg err">❌ ' + (d.error || 'Konnte nicht gestartet werden.') + '</div>';
+      return;
+    }}
+    selfUpdatePoll(content, modal);
+  }}).catch(function() {{
+    selfUpdatePoll(content, modal);
+  }});
+  return false;
+}}
 </script>
 </body></html>
 """
@@ -1715,27 +1744,54 @@ def _fetch_latest_release_for_repo(repo):
 
 SELF_UPDATE_GITHUB_REPO = "Chrischn73/setup-portal"
 SELF_UPDATE_FILES = ("setup_portal.py", "setup-portal.sh", "regen-issue.sh")
+# Ergebnis des letzten Selbst-Update-Checks (egal ob vom taeglichen Timer
+# oder manuell per "Jetzt prüfen"-Button ausgeloest) - EINE gemeinsame
+# Datei, kein App-Bezug. Schreibender Prozess ist immer die --self-update-
+# CLI-Instanz (eigener, kurzlebiger Prozess), gelesen wird sie vom
+# laufenden Webserver fuer die Live-Anzeige/Polling in der UI.
+SELF_UPDATE_CHECK_STATE_PATH = f"{STATE_DIR}/self_update_check.json"
+
+
+def _write_self_update_state(done, ok=None, detail=None):
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(SELF_UPDATE_CHECK_STATE_PATH, "w") as f:
+            json.dump({"done": done, "ok": ok, "detail": detail}, f)
+    except OSError:
+        pass  # Anzeige bleibt dann einfach beim vorherigen Stand bzw. "laeuft" haengen
+
+
+def read_self_update_check_state():
+    try:
+        with open(SELF_UPDATE_CHECK_STATE_PATH) as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {"done": True, "ok": None, "detail": None}
 
 
 def _self_update():
     """Aktualisiert das Portal selbst auf die neueste GitHub-Release-Version,
     OHNE ueber die generische App-Update-Engine (perform_update()) zu gehen -
     bewusst ein eigener, einfacherer Pfad, weil hier Update-Werkzeug und
-    Update-Ziel dieselbe Datei sind. Wird NUR vom taeglichen Timer aufgerufen
-    (--self-update, ein eigener kurzlebiger Prozess), NIEMALS aus der
-    laufenden Webserver-Instanz heraus (z. B. per Klick in der Oberflaeche) -
-    ein "systemctl restart" des eigenen Dienstes, ausgeloest aus einem
+    Update-Ziel dieselbe Datei sind. Wird vom taeglichen Timer ODER manuell
+    per "Jetzt prüfen"-Button (siehe trigger_self_update_check()) aufgerufen
+    - in BEIDEN Faellen als eigener, kurzlebiger --self-update-Prozess,
+    NIEMALS als Thread in der laufenden Webserver-Instanz - ein
+    "systemctl restart" des eigenen Dienstes, ausgeloest aus einem
     Anfrage-Thread DIESES Dienstes heraus, waere fragil (der Thread, der
-    darauf wartet, wird beim Neustart mit beendet). Deshalb gibt es dafuer
-    bewusst KEINEN Button und KEINE Route in der Web-UI - reines Timer/CLI-
-    Feature."""
+    darauf wartet, wird beim Neustart mit beendet). Jeder Ausgang schreibt
+    das Ergebnis nach SELF_UPDATE_CHECK_STATE_PATH, damit die Web-UI es
+    per Polling anzeigen kann (der Button selbst loest nur den separaten
+    systemd-Dienst aus, siehe trigger_self_update_check())."""
     print(f"Setup-Portal-Update-Check (aktuell: v{PORTAL_VERSION})...", file=sys.stderr)
     release = _fetch_latest_release_for_repo(SELF_UPDATE_GITHUB_REPO)
     if not release or not release.get("tarball_url"):
         print("Konnte keine Release-Information abrufen.", file=sys.stderr)
+        _write_self_update_state(True, False, "Konnte keine Release-Information von GitHub abrufen.")
         return
     if parse_version(release["tag"]) <= parse_version(PORTAL_VERSION):
         print(f"Bereits aktuell (neueste Version: {release['tag']}).", file=sys.stderr)
+        _write_self_update_state(True, True, f"Du hast bereits die neueste Version ({release['tag']}).")
         return
     print(f"Neuere Version gefunden: {release['tag']} - lade herunter...", file=sys.stderr)
     try:
@@ -1748,6 +1804,7 @@ def _self_update():
             entries = os.listdir(tmpdir)
             if len(entries) != 1:
                 print("Unerwarteter Archivinhalt (GitHub-Tarball-Struktur hat sich geaendert).", file=sys.stderr)
+                _write_self_update_state(True, False, "Unerwarteter Archivinhalt (GitHub-Tarball-Struktur hat sich geändert).")
                 return
             src_root = os.path.join(tmpdir, entries[0])
             for name in SELF_UPDATE_FILES:
@@ -1771,8 +1828,12 @@ def _self_update():
                     print(f"WARNUNG: .service-Datei konnte nicht aktualisiert werden: {e}", file=sys.stderr)
     except (urllib.error.URLError, OSError, tarfile.TarError) as e:
         print(f"Update fehlgeschlagen: {e}", file=sys.stderr)
+        _write_self_update_state(True, False, f"Update fehlgeschlagen: {e}")
         return
     print(f"Update auf {release['tag']} installiert - starte Dienst neu...", file=sys.stderr)
+    # Bewusst VOR dem Neustart schreiben: der Neustart beendet diesen
+    # Prozess ggf. mit, eine Schreibaktion danach waere nicht mehr sicher.
+    _write_self_update_state(True, True, f"Auf {release['tag']} aktualisiert - Dienst wird neu gestartet.")
     subprocess.run(["systemctl", "restart", "setup-portal.service"], capture_output=True, text=True)
 
 
@@ -1785,21 +1846,26 @@ def trigger_self_update_check():
     Anfrage-Thread DESSELBEN Dienstes heraus zu tun waere fragil (der
     Thread stirbt mit dem Neustart, siehe Docstring dort). "--no-block"
     laesst systemctl sofort zurueckkehren, statt auf den Abschluss des
-    Oneshot-Dienstes zu warten - der eigentliche Check/Update laeuft dann
-    unabhaengig im Hintergrund weiter, auch wenn dieser Request schon
-    lange beantwortet ist."""
+    Oneshot-Dienstes zu warten - das tatsaechliche Ergebnis (auch bei
+    einem zwischenzeitlichen Dienst-Neustart) liest die UI per Polling
+    aus SELF_UPDATE_CHECK_STATE_PATH (siehe read_self_update_check_state()),
+    NICHT aus der Antwort dieser Funktion. Gibt (True, None) oder
+    (False, Fehlertext) zurueck - Fehler hier bedeuten "Start selbst hat
+    nicht geklappt", nicht "keine neue Version gefunden"."""
+    _write_self_update_state(False)  # "laeuft" - erst der --self-update-Prozess selbst setzt done=True
     try:
         result = subprocess.run(
             ["systemctl", "start", "--no-block", "setup-portal-update-check.service"],
             capture_output=True, text=True, timeout=15,
         )
     except (subprocess.TimeoutExpired, OSError) as e:
+        _write_self_update_state(True, False, f"Konnte die Prüfung nicht starten: {e}")
         return False, f"Konnte die Prüfung nicht starten: {e}"
     if result.returncode != 0:
-        return False, (result.stderr or result.stdout or "Unbekannter Fehler").strip()
-    return True, ("Prüfung gestartet. Falls eine neue Version gefunden wird, aktualisiert sich das Portal "
-                   "automatisch im Hintergrund - diese Seite ist dann für ein paar Sekunden nicht erreichbar, "
-                   "während der Dienst neu startet.")
+        error = (result.stderr or result.stdout or "Unbekannter Fehler").strip()
+        _write_self_update_state(True, False, error)
+        return False, error
+    return True, None
 
 
 def fetch_latest_release(app):
@@ -2196,21 +2262,28 @@ Descriptor-Änderungen) werden dabei NICHT übernommen. Falls nötig, hier ohne 
 </div>"""
 
 
-def render_self_update_card(message=""):
+def render_self_update_card():
+    """Zeigt zusaetzlich das Ergebnis des letzten Checks an (egal ob vom
+    taeglichen Timer oder manuell ausgeloest) - liest denselben Zustand,
+    den auch das Live-Polling nach einem Klick abfragt, siehe
+    read_self_update_check_state()."""
+    state = read_self_update_check_state()
+    status_line = ""
+    if state.get("done") and state.get("detail"):
+        cls = "ok" if state.get("ok") else "err"
+        icon = "✅" if state.get("ok") else "❌"
+        status_line = f'<div class="msg {cls}" style="font-size:.85rem;">{icon} {html.escape(state["detail"])}</div>'
     return f"""
 <div class="msg app-section">
 <h2>🔧 Setup-Portal-Update</h2>
 <p class="muted">Version {PORTAL_VERSION}. Aktualisiert sich taeglich automatisch (02:30 Uhr) direkt aus den
 GitHub-Releases von <code>{html.escape(SELF_UPDATE_GITHUB_REPO)}</code> - unabhaengig von den Apps oben.</p>
-{message}
-<form method="post" action="/update/self-update-check"
-      onsubmit="return confirm('Jetzt auf eine neue Portal-Version prüfen? Falls eine gefunden wird, startet der Dienst kurz neu - diese Seite ist dann kurz nicht erreichbar.')">
-  <button type="submit" class="btn-small">🔄 Jetzt auf neue Version prüfen</button>
-</form>
+{status_line}
+<button type="button" class="btn-small" onclick="return startSelfUpdateCheck()">🔄 Jetzt auf neue Version prüfen</button>
 </div>"""
 
 
-def render_update_overview(message="", self_update_message=""):
+def render_update_overview(message=""):
     apps = load_apps()
     if not apps:
         app_sections = '<p class="muted">Keine Anwendung registriert.</p>'
@@ -2227,7 +2300,7 @@ def render_update_overview(message="", self_update_message=""):
         message=message,
         app_sections=app_sections,
         all_update_button=all_update_button,
-        self_update_card=render_self_update_card(self_update_message),
+        self_update_card=render_self_update_card(),
     )
 
 
@@ -2472,6 +2545,9 @@ class BaseHandler(BaseHTTPRequestHandler):
         if path == "/update":
             self._send_html(render_update_overview())
             return
+        if path == "/update/self-update-check/status":
+            self._send_json(read_self_update_check_state())
+            return
         m = re.match(r"^/update/status/([^/]+)$", path)
         if m:
             app_id = unquote(m.group(1))
@@ -2699,9 +2775,11 @@ class BaseHandler(BaseHTTPRequestHandler):
             self._send_html(render_update_overview(msg))
             return
         if path == "/update/self-update-check":
-            ok, detail = trigger_self_update_check()
-            msg = (f'<div class="msg ok">✅ {detail}</div>' if ok else f'<div class="msg err">{detail}</div>')
-            self._send_html(render_update_overview(self_update_message=msg))
+            started, error = trigger_self_update_check()
+            if not started:
+                self._send_json({"started": False, "error": error})
+                return
+            self._send_json({"started": True})
             return
 
         if path in ("/wifi/connect", "/wifi/disconnect") and not IS_PI:
