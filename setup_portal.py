@@ -102,7 +102,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote
 
-PORTAL_VERSION = "1.8.4"
+PORTAL_VERSION = "1.8.5"
 
 PORTAL_DIR = "/opt/setup-portal"
 # Jede App legt hier per eigenem install.sh genau eine Datei <app-id>.json
@@ -477,7 +477,6 @@ PAGE_FORM = """<!doctype html>
 {header}
 <h1>📶 WLAN-Einstellungen</h1>
 {status}
-<a class="btn" href="/">← Zurück zur Übersicht</a>
 {message}
 <form method="post" action="/wifi/connect">
   <label for="ssid">WLAN-Name (SSID)</label>
@@ -489,6 +488,7 @@ PAGE_FORM = """<!doctype html>
   <button type="submit">Verbinden</button>
 </form>
 {disconnect_form}
+<a class="btn" href="/" style="margin-top:1.5rem;">← Zurück zur Übersicht</a>
 <script>
 fetch('/wifi/networks').then(r => r.json()).then(function(nets) {{
   var loading = document.getElementById('ssid-loading');
