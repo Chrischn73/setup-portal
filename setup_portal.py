@@ -83,6 +83,7 @@ kein Foto-Handling, nichts), es kennt nur das generische Schema.
 
 Nur Python-Standardbibliothek.
 """
+import hashlib
 import html
 import io
 import json
@@ -102,7 +103,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote
 
-PORTAL_VERSION = "1.8.5"
+PORTAL_VERSION = "1.8.6"
 
 PORTAL_DIR = "/opt/setup-portal"
 # Jede App legt hier per eigenem install.sh genau eine Datei <app-id>.json
@@ -1700,6 +1701,34 @@ def _auto_update_config_path(app_id):
     return os.path.join(_state_dir(app_id), "update.conf")
 
 
+def _install_sh_hash_path(app_id):
+    return os.path.join(_state_dir(app_id), "install_sh.sha256")
+
+
+def _read_installed_install_sh_hash(app_id):
+    """Hash des install.sh-Standes, mit dem zuletzt ein VOLLSTAENDIGER Lauf
+    (Erst-Installation oder "Komplett von GitHub aktualisieren") ausgefuehrt
+    wurde. None, wenn das noch nie erfasst wurde (z. B. Installationen von
+    vor dieser Funktion, oder eine App, die noch nie ueber diesen
+    Mechanismus voll installiert wurde) - wird dann als "unbekannt, sicherheits-
+    halber lieber empfehlen" behandelt, siehe render_update_card()."""
+    try:
+        with open(_install_sh_hash_path(app_id)) as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
+def _write_installed_install_sh_hash(app_id, digest):
+    try:
+        path = _install_sh_hash_path(app_id)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write(digest)
+    except OSError:
+        pass
+
+
 def app_version(app):
     try:
         with open(app["update"]["version_file"]) as f:
@@ -1739,6 +1768,25 @@ def _fetch_latest_release_for_repo(repo):
             return None
         return {"tag": tag, "notes": (data.get("body") or "").strip(), "tarball_url": data.get("tarball_url") or ""}
     except (urllib.error.URLError, OSError, json.JSONDecodeError, ValueError):
+        return None
+
+
+def _fetch_raw_file(repo, tag, path, timeout=15):
+    """Laedt eine einzelne Datei aus einem bestimmten Tag/Release direkt
+    (raw.githubusercontent.com), OHNE den kompletten Quellcode-Tarball
+    herunterzuladen - genutzt, um install.sh auf Aenderungen seit dem
+    letzten vollstaendigen Lauf zu pruefen (siehe render_update_card()),
+    ohne bei jedem Update-Check den ganzen Tarball zu laden. Gibt None bei
+    jedem Fehler zurueck (fehlende Datei, kein Internet, o.ae.) - der
+    Aufrufer behandelt das dann als "unbekannt", nicht als Absturz."""
+    try:
+        req = urllib.request.Request(
+            f"https://raw.githubusercontent.com/{repo}/{tag}/{path}",
+            headers={"User-Agent": "Pi-Setup-Update-Check"},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read()
+    except (urllib.error.URLError, OSError):
         return None
 
 
@@ -2110,13 +2158,17 @@ def _download_and_run_install_script(github_repo, install_script_path, label):
     ausfuehren (siehe _run_install_script_in_background) - z. B. weil eine
     Aenderung NUR install.sh selbst betrifft und deshalb nie per normalem,
     file_map-basiertem Update (perform_update()) uebernommen wird. Gibt
-    (ok, detail) zurueck, wirft KEINE Exception weiter (Aufrufer muss trotzdem
-    subprocess.TimeoutExpired/Exception selbst abfangen - die Ausnahmen aus
-    urllib/tarfile hier drin sind bewusst NICHT gefangen, damit der Aufrufer
-    seinen jeweils eigenen State-Speicher im except-Block aktualisieren kann)."""
+    (ok, detail, install_sh_hash) zurueck - install_sh_hash ist der sha256-Hash
+    des GENAU hier ausgefuehrten install.sh (None bei jedem Fehlschlag davor),
+    damit der Aufrufer bei Erfolg per _write_installed_install_sh_hash() einen
+    neuen Vergleichs-Ausgangspunkt fuer render_update_card() setzen kann. Wirft
+    KEINE Exception weiter (Aufrufer muss trotzdem subprocess.TimeoutExpired/
+    Exception selbst abfangen - die Ausnahmen aus urllib/tarfile hier drin
+    sind bewusst NICHT gefangen, damit der Aufrufer seinen jeweils eigenen
+    State-Speicher im except-Block aktualisieren kann)."""
     release = _fetch_latest_release_for_repo(github_repo)
     if not release or not release.get("tarball_url"):
-        return False, "Neueste Version konnte nicht ermittelt werden."
+        return False, "Neueste Version konnte nicht ermittelt werden.", None
     req = urllib.request.Request(release["tarball_url"], headers={"User-Agent": "Pi-Setup-Install-Run"})
     with urllib.request.urlopen(req, timeout=60) as resp:
         archive_data = resp.read()
@@ -2125,27 +2177,31 @@ def _download_and_run_install_script(github_repo, install_script_path, label):
             tar.extractall(path=tmpdir, filter="data")
         entries = os.listdir(tmpdir)
         if len(entries) != 1:
-            return False, "Unerwarteter Archivinhalt (GitHub-Tarball-Struktur hat sich geaendert)."
+            return False, "Unerwarteter Archivinhalt (GitHub-Tarball-Struktur hat sich geaendert).", None
         src_root = os.path.join(tmpdir, entries[0])
         script = os.path.join(src_root, install_script_path)
         if not os.path.isfile(script):
-            return False, f"Installationsskript nicht gefunden ({install_script_path})."
+            return False, f"Installationsskript nicht gefunden ({install_script_path}).", None
+        with open(script, "rb") as f:
+            script_hash = hashlib.sha256(f.read()).hexdigest()
         # Kann je nach App mehrere Minuten dauern (apt-get, Kamera-Setup
         # usw.) - grosszuegiges Timeout, damit ein echter Haenger trotzdem
         # irgendwann als Fehler zurueckkommt statt den Thread fuer immer zu
         # blockieren.
         result = subprocess.run(["bash", script], cwd=src_root, capture_output=True, text=True, timeout=1800)
         if result.returncode == 0:
-            return True, f"{label}: install.sh wurde erfolgreich ausgefuehrt."
+            return True, f"{label}: install.sh wurde erfolgreich ausgefuehrt.", script_hash
         fehlerausgabe = (result.stderr or result.stdout or "").strip()[-800:]
-        return False, f"install.sh fehlgeschlagen (Exit-Code {result.returncode}): {fehlerausgabe}"
+        return False, f"install.sh fehlgeschlagen (Exit-Code {result.returncode}): {fehlerausgabe}", None
 
 
 def _run_companion_install_in_background(companion):
     app_id = companion["app_id"]
     try:
-        ok, detail = _download_and_run_install_script(
+        ok, detail, install_sh_hash = _download_and_run_install_script(
             companion["github_repo"], companion.get("install_script_path", "setup/install.sh"), companion["label"])
+        if ok and install_sh_hash:
+            _write_installed_install_sh_hash(app_id, install_sh_hash)
         _companion_install_state(app_id).update(done=True, ok=ok, detail=detail)
     except subprocess.TimeoutExpired:
         _companion_install_state(app_id).update(
@@ -2168,8 +2224,10 @@ def _run_install_script_in_background(app):
     vorhanden."""
     app_id = app["id"]
     try:
-        ok, detail = _download_and_run_install_script(
+        ok, detail, install_sh_hash = _download_and_run_install_script(
             app["update"]["github_repo"], app.get("install_script_path", "setup/install.sh"), app["label"])
+        if ok and install_sh_hash:
+            _write_installed_install_sh_hash(app_id, install_sh_hash)
         _update_state(app_id).update(done=True, ok=ok, detail=detail)
     except subprocess.TimeoutExpired:
         _update_state(app_id).update(done=True, ok=False, detail="Ausführung hat zu lange gedauert (Timeout).")
@@ -2181,6 +2239,7 @@ def render_update_card(app, message=""):
     app_id = app["id"]
     current = app_version(app)
     release = fetch_latest_release(app)
+    install_sh_changed = False
     if release is None:
         latest = "konnte nicht abgerufen werden"
         status_class = "err"
@@ -2193,6 +2252,20 @@ def render_update_card(app, message=""):
         notes_block = (f'<div class="msg" style="white-space:pre-wrap;">{html.escape(release["notes"])}</div>'
                        if update_available and release["notes"] else "")
         if update_available:
+            # Ob ein normales (file_map-basiertes) Update ausreicht, oder ob
+            # sich install.sh selbst seit dem letzten VOLLSTAENDIGEN Lauf
+            # geaendert hat (dann wuerden apt-Pakete/systemd-Dienste/
+            # Descriptor-Aenderungen NICHT ankommen, siehe perform_update()).
+            # Kein gespeicherter Vergleichs-Hash (nie ueber diesen Mechanismus
+            # voll installiert) zaehlt bewusst auch als "geaendert" - im
+            # Zweifel lieber einmal zu oft auf "Komplett aktualisieren"
+            # hinweisen als das genau hier aufgetretene Muster (Update kam
+            # nie an, weil install.sh nie erneut lief) unbemerkt zu lassen.
+            install_script_path = app.get("install_script_path", "setup/install.sh")
+            raw_install_sh = _fetch_raw_file(app["update"]["github_repo"], latest, install_script_path)
+            if raw_install_sh is not None:
+                neuer_hash = hashlib.sha256(raw_install_sh).hexdigest()
+                install_sh_changed = neuer_hash != _read_installed_install_sh_hash(app_id)
             action_block = (
                 f'<form onsubmit="return startUpdate(\'{app_id}\', \'{latest}\')">'
                 f'<button type="submit" class="btn-danger">⬇ Auf {latest} aktualisieren</button>'
@@ -2254,10 +2327,15 @@ werden dabei ausgeschaltet, falls es ein Rueckschritt ist):</p>
   <button type="submit" class="btn-small">Einstellung speichern</button>
 </form>
 
+{f'''<div class="msg err" style="margin-top:1rem;">
+⚠️ <strong>install.sh</strong> hat sich seit der letzten vollständigen Installation geändert (oder es gibt noch
+keinen Vergleichswert). Ein normales Update reicht dann evtl. nicht - bitte stattdessen den Button
+"Komplett von GitHub aktualisieren" nutzen.
+</div>''' if install_sh_changed else ''}
 <p class="muted" style="font-size:.85rem; margin-top:1rem;">Ein normales Update kopiert nur die
 App-eigenen Dateien - Änderungen an <code>install.sh</code> selbst (z. B. neue Setup-Funktionen,
 Descriptor-Änderungen) werden dabei NICHT übernommen. Falls nötig, hier ohne SSH nachholen:</p>
-<button type="button" class="btn-small" onclick="return startInstallRun('{app_id}')">🔄 Komplett von GitHub aktualisieren</button>
+<button type="button" class="{'btn-danger' if install_sh_changed else 'btn-small'}" onclick="return startInstallRun('{app_id}')">🔄 Komplett von GitHub aktualisieren</button>
 {changelog_block}
 </div>"""
 
