@@ -103,7 +103,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote
 
-PORTAL_VERSION = "1.8.6"
+PORTAL_VERSION = "1.8.7"
 
 PORTAL_DIR = "/opt/setup-portal"
 # Jede App legt hier per eigenem install.sh genau eine Datei <app-id>.json
@@ -585,7 +585,9 @@ PAGE_BACKUP = """<!doctype html>
 {all_backup_button}
 
 <h2>Einstellungen</h2>
-<p class="muted">Backups laufen automatisch jede Nacht (03:30 Uhr). Aufbewahrung
+<p class="muted">Backups laufen automatisch jede Nacht (03:30 Uhr) – aber nur, wenn sich
+seit dem letzten Backup etwas geändert hat, sonst wird nichts geschrieben
+(schont die SD-Karte). Aufbewahrung
 nach dem Vater-Sohn-Prinzip: die letzten 14 Tage einzeln, danach automatisch
 ausgedünnt auf eine Sicherung pro Woche, Monat und Jahr – so bleibt auch
 ältere Historie sinnvoll erhalten, ohne dass du Zeitpläne oder Stufen selbst
