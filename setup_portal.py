@@ -103,7 +103,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote
 
-PORTAL_VERSION = "1.8.7"
+PORTAL_VERSION = "1.8.8"
 
 PORTAL_DIR = "/opt/setup-portal"
 # Jede App legt hier per eigenem install.sh genau eine Datei <app-id>.json
@@ -419,7 +419,33 @@ PAGE_VPN = """<!doctype html>
 öffentlich ins Internet freizugeben. Die folgenden Schritte gelten für eine Fritzbox (ab FRITZ!OS 7.39, WireGuard
 ist dort eingebaut) und die WireGuard-App auf dem Handy.</p>
 
-<h2>1. VPN-Zugang auf der Fritzbox einrichten</h2>
+<h2>1. Feste Adresse für zu Hause einrichten (DynDNS)</h2>
+<p class="muted">Die Internet-Adresse deines Anschlusses ändert sich regelmäßig. Damit das Handy die Fritzbox
+von unterwegs trotzdem findet, bekommt sie einen festen Namen (z. B. <code>honigbox.dynv6.net</code>). Das ist
+kostenlos und muss <b>vor</b> dem VPN eingerichtet werden.</p>
+<div class="hilfe-step">
+  <p>Auf <code>dynv6.com</code> ein kostenloses Konto anlegen und anmelden.</p>
+</div>
+<div class="hilfe-step">
+  <p>Dort einen Domainnamen anlegen, z. B. <code>honigbox.dynv6.net</code>.</p>
+</div>
+<div class="hilfe-step">
+  <p>dynv6 zeigt zu diesem Namen eine <b>Update-URL</b> und einen <b>Benutzernamen</b> an (eine lange, zufällige
+  Zeichenfolge, z. B. <code>xk27Us3sX4RGEc6j-ELaZ3YxnjxsjK</code>). Beides kopieren bzw. notieren.</p>
+</div>
+<div class="hilfe-step">
+  <p>Auf <code>fritz.box</code> anmelden, zu „Internet" → „Freigaben" → Reiter „DynDNS" wechseln und „DynDns aktiv"
+  anhaken. Dann eintragen:</p>
+  <ul>
+    <li><b>Update-URL:</b> die URL von dynv6 (komplett, so wie angezeigt)</li>
+    <li><b>Domainnamen:</b> z. B. <code>honigbox.dynv6.net</code></li>
+    <li><b>Benutzername:</b> der Benutzername von dynv6 (die lange Zeichenfolge)</li>
+    <li><b>Kennwort:</b> <code>none</code></li>
+  </ul>
+  <p>Mit „Übernehmen" speichern. Ab jetzt meldet die Fritzbox ihre aktuelle Adresse selbst an dynv6.</p>
+</div>
+
+<h2>2. VPN-Zugang auf der Fritzbox einrichten</h2>
 <div class="hilfe-step">
   <p>Im Heimnetz auf <code>fritz.box</code> mit dem Fritzbox-Kennwort anmelden.</p>
   <img src="{vpn_img_prefix}/fritzbox-1.png" alt="" onerror="this.style.display='none'">
@@ -444,7 +470,7 @@ ist dort eingebaut) und die WireGuard-App auf dem Handy.</p>
   <img src="{vpn_img_prefix}/fritzbox-5.png" alt="" onerror="this.style.display='none'">
 </div>
 
-<h2>2. WireGuard auf dem Handy einrichten</h2>
+<h2>3. WireGuard auf dem Handy einrichten</h2>
 <div class="hilfe-step">
   <p>Die App „WireGuard" aus dem App Store (iPhone) bzw. Play Store (Android) installieren.</p>
   <img src="{vpn_img_prefix}/wireguard-1.png" alt="" onerror="this.style.display='none'">
