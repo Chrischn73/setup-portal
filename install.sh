@@ -42,6 +42,10 @@ mkdir -p /opt/setup-portal/apps.d /opt/setup-portal/issue.d \
          /opt/setup-portal/state /opt/setup-portal/hilfe-bilder/_shared
 
 cp "$SETUP_DIR/setup_portal.py" /opt/setup-portal/setup_portal.py
+# Mitgelieferte Hilfe-Bilder (falls vorhanden); eigene Bilder bleiben erhalten
+if [ -d "$SETUP_DIR/hilfe-bilder" ]; then
+    cp -f "$SETUP_DIR"/hilfe-bilder/*.png "$SETUP_DIR"/hilfe-bilder/*.jpg /opt/setup-portal/hilfe-bilder/_shared/ 2>/dev/null || true
+fi
 cp "$SETUP_DIR/setup-portal.sh" /opt/setup-portal/setup-portal.sh
 cp "$SETUP_DIR/regen-issue.sh" /opt/setup-portal/regen-issue.sh
 chmod +x /opt/setup-portal/setup-portal.sh /opt/setup-portal/regen-issue.sh

@@ -103,7 +103,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote
 
-PORTAL_VERSION = "1.8.8"
+PORTAL_VERSION = "1.8.9"
 
 PORTAL_DIR = "/opt/setup-portal"
 # Jede App legt hier per eigenem install.sh genau eine Datei <app-id>.json
@@ -425,6 +425,7 @@ von unterwegs trotzdem findet, bekommt sie einen festen Namen (z. B. <code>honig
 kostenlos und muss <b>vor</b> dem VPN eingerichtet werden.</p>
 <div class="hilfe-step">
   <p>Auf <code>dynv6.com</code> ein kostenloses Konto anlegen und anmelden.</p>
+  <img src="{vpn_img_prefix}/dyndns-1.png" alt="" onerror="this.style.display='none'">
 </div>
 <div class="hilfe-step">
   <p>Dort einen Domainnamen anlegen, z. B. <code>honigbox.dynv6.net</code>.</p>
@@ -443,6 +444,7 @@ kostenlos und muss <b>vor</b> dem VPN eingerichtet werden.</p>
     <li><b>Kennwort:</b> <code>none</code></li>
   </ul>
   <p>Mit „Übernehmen" speichern. Ab jetzt meldet die Fritzbox ihre aktuelle Adresse selbst an dynv6.</p>
+  <img src="{vpn_img_prefix}/dyndns-2.png" alt="" onerror="this.style.display='none'">
 </div>
 
 <h2>2. VPN-Zugang auf der Fritzbox einrichten</h2>
@@ -464,10 +466,11 @@ kostenlos und muss <b>vor</b> dem VPN eingerichtet werden.</p>
 </div>
 <div class="hilfe-step">
   <p>Zur Bestätigung muss an der Fritzbox nun ein beliebiger Knopf gedrückt werden.</p>
+  <img src="{vpn_img_prefix}/fritzbox-5.png" alt="" onerror="this.style.display='none'">
 </div>
 <div class="hilfe-step">
   <p>Nun wird ein QR-Code angezeigt. Diesen abspeichern und danach mit der WireGuard-App am Handy einscannen.</p>
-  <img src="{vpn_img_prefix}/fritzbox-5.png" alt="" onerror="this.style.display='none'">
+  <img src="{vpn_img_prefix}/fritzbox-6.png" alt="" onerror="this.style.display='none'">
 </div>
 
 <h2>3. WireGuard auf dem Handy einrichten</h2>
@@ -1889,6 +1892,16 @@ def _self_update():
                     shutil.copy(src, os.path.join(PORTAL_DIR, name))
             os.chmod(os.path.join(PORTAL_DIR, "setup-portal.sh"), 0o755)
             os.chmod(os.path.join(PORTAL_DIR, "regen-issue.sh"), 0o755)
+            # Mitgelieferte Hilfe-Bilder (Repo-Ordner hilfe-bilder/) nach
+            # _shared kopieren; selbst abgelegte Bilder mit anderem Namen
+            # bleiben unberuehrt.
+            bilder_src = os.path.join(src_root, "hilfe-bilder")
+            if os.path.isdir(bilder_src):
+                bilder_dst = os.path.join(HILFE_IMAGES_DIR, "_shared")
+                os.makedirs(bilder_dst, exist_ok=True)
+                for fname in os.listdir(bilder_src):
+                    if HILFE_IMAGE_NAME_RE.match(fname):
+                        shutil.copy(os.path.join(bilder_src, fname), os.path.join(bilder_dst, fname))
             # Die .service-Datei separat und NICHT-fatal behandeln: sie
             # aendert sich viel seltener als der Python-Code, und ein
             # Fehler hier (z. B. /etc kurzzeitig nicht schreibbar) soll
