@@ -80,6 +80,18 @@ kein Foto-Handling, nichts), es kennt nur das generische Schema.
   prueft das eigene GitHub-Repo (SELF_UPDATE_GITHUB_REPO) auf ein neueres
   Release und aktualisiert sich bei Bedarf selbst. Bewusst NUR per Timer/
   CLI, nicht per Web-UI-Button (siehe Kommentar bei _self_update()).
+- Automatische App-Updates (--check-update, taeglich per App-Timer) werden
+  gestaffelt verteilt: jede Installation wartet pro Release eine eigene,
+  aus /etc/machine-id abgeleitete Frist von 0..ROLLOUT_WINDOW_DAYS-1 Tagen
+  (siehe auto_update_due()) - ein fehlerhaftes Release trifft so nicht alle
+  Installationen in derselben Nacht. URGENT_MARKER im Release-Text hebt die
+  Frist auf. Hat sich install.sh seit dem letzten vollstaendigen Lauf
+  geaendert, startet nach dem normalen Update zusaetzlich automatisch ein
+  Komplett-Lauf (abschaltbar, Standard an) - als eigene systemd-run-Einheit
+  (CLI --auto-install-sh), siehe _start_auto_install_sh() fuer den Grund.
+- Nutzungszaehler: --check-update laedt einmal pro Tag ein kleines Asset
+  aus dem Release STATS_RELEASE_TAG des App-Repos; GitHub zaehlt die
+  Downloads (download_count). Es wird nichts mitgesendet.
 
 Nur Python-Standardbibliothek.
 """
@@ -100,10 +112,11 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote
 
-PORTAL_VERSION = "1.8.10"
+PORTAL_VERSION = "1.8.11"
 
 PORTAL_DIR = "/opt/setup-portal"
 # Jede App legt hier per eigenem install.sh genau eine Datei <app-id>.json
@@ -1760,6 +1773,140 @@ def _write_installed_install_sh_hash(app_id, digest):
         pass
 
 
+def install_sh_changed(app, tag):
+    """True, wenn install.sh im Release 'tag' vom zuletzt VOLLSTAENDIG
+    ausgefuehrten Stand abweicht - auch, wenn es noch gar keinen
+    Vergleichswert gibt (im Zweifel lieber einmal zu oft voll installieren,
+    siehe render_update_card()). False, wenn gleich ODER install.sh nicht
+    abrufbar war (kein Internet o.ae. - dann lieber nichts ausloesen)."""
+    install_script_path = app.get("install_script_path", "setup/install.sh")
+    raw_install_sh = _fetch_raw_file(app["update"]["github_repo"], tag, install_script_path)
+    if raw_install_sh is None:
+        return False
+    return hashlib.sha256(raw_install_sh).hexdigest() != _read_installed_install_sh_hash(app["id"])
+
+
+# Gestaffelte Verteilung automatischer Updates, siehe auto_update_due().
+ROLLOUT_WINDOW_DAYS = 14
+# Steht dieser Text (Gross-/Kleinschreibung egal) im Release-Text, gilt fuer
+# dieses Release keine Wartefrist - fuer dringende Fixes.
+URGENT_MARKER = "[urgent]"
+
+
+def _machine_id():
+    """Stabile, geraeteeigene Kennung - verlaesst das Geraet NIE, dient nur
+    als Startwert fuer die Wartefrist. Fallback Hostname (z. B. Container
+    ohne /etc/machine-id)."""
+    try:
+        with open("/etc/machine-id") as f:
+            mid = f.read().strip()
+        if mid:
+            return mid
+    except OSError:
+        pass
+    return socket.gethostname()
+
+
+def rollout_delay_days(app_id, tag):
+    """Wartefrist dieser Installation fuer GENAU dieses Release, 0..ROLLOUT_
+    WINDOW_DAYS-1 Tage. Pro Release neu gewuerfelt (Tag geht in den Hash
+    ein), damit nicht immer dieselben Installationen zuerst dran sind -
+    aber deterministisch, also ohne gespeicherten Zustand und bei jedem
+    Check gleich."""
+    digest = hashlib.sha256(f"{_machine_id()}:{app_id}:{tag}".encode("utf-8")).hexdigest()
+    return int(digest, 16) % ROLLOUT_WINDOW_DAYS
+
+
+def _parse_github_time(value):
+    try:
+        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def auto_update_due(app, current, releases):
+    """Ab wann diese Installation ein neueres Release automatisch
+    installieren darf: (Zeitpunkt als Unix-Zeit, dringend?) oder (None,
+    False), wenn es nichts Neueres gibt. Die Frist zaehlt ab dem AELTESTEN
+    noch nicht installierten Release, nicht ab dem neuesten - sonst koennte
+    eine Installation mit langer Frist bei haeufigen Releases nie dran
+    kommen, weil jedes neue Release die Uhr zuruecksetzt. Installiert wird
+    dann trotzdem immer das neueste. Fehlt das Veroeffentlichungsdatum,
+    wird nicht gewartet (lieber aktualisieren als ewig haengen)."""
+    pending = [r for r in releases
+               if not r.get("prerelease") and parse_version(r["tag"]) > parse_version(current)]
+    if not pending:
+        return None, False
+    if any(URGENT_MARKER in (r.get("notes") or "").lower() for r in pending):
+        return 0, True
+    oldest = min(pending, key=lambda r: parse_version(r["tag"]))
+    published = _parse_github_time(oldest.get("published_at"))
+    if published is None:
+        return 0, False
+    return published + rollout_delay_days(app["id"], oldest["tag"]) * 86400, False
+
+
+def _auto_install_sh_config_path(app_id):
+    return os.path.join(_state_dir(app_id), "install_sh_auto.conf")
+
+
+def get_auto_install_sh(app_id):
+    """Standard AN, falls die Konfigurationsdatei fehlt oder unlesbar ist -
+    eigene Datei statt update.conf, weil set_auto_update() diese komplett
+    neu schreibt."""
+    try:
+        with open(_auto_install_sh_config_path(app_id)) as f:
+            m = re.search(r"^AUTO_INSTALL_SH=(\d)", f.read(), re.MULTILINE)
+        if m:
+            return m.group(1) == "1"
+    except OSError:
+        pass
+    return True
+
+
+def set_auto_install_sh(app_id, enabled):
+    try:
+        path = _auto_install_sh_config_path(app_id)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write(f"AUTO_INSTALL_SH={1 if enabled else 0}\n")
+        return True, "Einstellung gespeichert."
+    except OSError as e:
+        return False, str(e)
+
+
+# Nutzungszaehler: ein als "Pre-release" markiertes Release mit diesem Tag
+# im jeweiligen App-Repo, darin ein beliebiges kleines Asset dieses Namens.
+# Pre-release, weil GitHub es sonst als "latest" behandeln wuerde - der
+# Update-Check fiele dann auf den Tag "stats" statt auf die echte Version.
+# Fehlt das Release, passiert einfach nichts.
+STATS_RELEASE_TAG = "stats"
+STATS_ASSET_NAME = "ping.txt"
+
+
+def send_stats_ping(app):
+    """Hoechstens einmal pro Kalendertag und App (auch wenn --check-update
+    oefter laeuft, z. B. weil install.sh den Check-Dienst selbst startet).
+    Ein reiner Download ohne Parameter - GitHub sieht dabei nur, was es bei
+    jedem Update-Check ohnehin sieht."""
+    state = read_update_check_state(app)
+    today = time.strftime("%Y-%m-%d")
+    if state.get("last_ping_date") == today:
+        return
+    try:
+        req = urllib.request.Request(
+            f"https://github.com/{app['update']['github_repo']}/releases/download/"
+            f"{STATS_RELEASE_TAG}/{STATS_ASSET_NAME}",
+            headers={"User-Agent": "Pi-Setup-Update-Check"},
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            resp.read()
+    except (urllib.error.URLError, OSError):
+        return
+    state["last_ping_date"] = today
+    _write_update_check_state(app["id"], state)
+
+
 def app_version(app):
     try:
         with open(app["update"]["version_file"]) as f:
@@ -1797,7 +1944,8 @@ def _fetch_latest_release_for_repo(repo):
         tag = data.get("tag_name") or ""
         if not tag:
             return None
-        return {"tag": tag, "notes": (data.get("body") or "").strip(), "tarball_url": data.get("tarball_url") or ""}
+        return {"tag": tag, "notes": (data.get("body") or "").strip(), "tarball_url": data.get("tarball_url") or "",
+                "published_at": data.get("published_at") or ""}
     except (urllib.error.URLError, OSError, json.JSONDecodeError, ValueError):
         return None
 
@@ -1971,8 +2119,9 @@ def fetch_all_releases(app, limit=10):
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read().decode("utf-8"))
         return [{"tag": r["tag_name"], "tarball_url": r.get("tarball_url") or "",
-                  "notes": (r.get("body") or "").strip(), "published_at": r.get("published_at") or ""}
-                for r in data if r.get("tag_name")]
+                  "notes": (r.get("body") or "").strip(), "published_at": r.get("published_at") or "",
+                  "prerelease": bool(r.get("prerelease"))}
+                for r in data if r.get("tag_name") and r["tag_name"] != STATS_RELEASE_TAG]
     except (urllib.error.URLError, OSError, json.JSONDecodeError, ValueError, KeyError):
         return []
 
@@ -2026,29 +2175,7 @@ def read_update_check_state(app):
         return {"current": app_version(app), "latest": None, "update_available": False, "checked_at": None}
 
 
-def run_update_check_once(app):
-    """Einmaliger Versions-Check fuer EINE App, Ergebnis wird zwischen-
-    gespeichert (per Timer regelmaessig aufgerufen, siehe --check-update)."""
-    app_id = app["id"]
-    current = app_version(app)
-    release = fetch_latest_release(app)
-    update_available = bool(release) and parse_version(release["tag"]) > parse_version(current)
-    auto_updated_version = read_update_check_state(app).get("auto_updated_version")
-    if update_available and get_auto_update(app_id) and release.get("tarball_url"):
-        ok, detail = perform_update(app, release["tarball_url"], release["tag"])
-        _update_state(app_id).update(done=True, ok=ok, detail=detail)
-        if ok:
-            current = app_version(app)
-            update_available = False
-            auto_updated_version = current
-    state = {
-        "current": current,
-        "latest": release["tag"] if release else None,
-        "update_available": update_available,
-        "checked_at": time.strftime("%Y-%m-%d %H:%M"),
-        "notes": (release.get("notes") if release else None),
-        "auto_updated_version": auto_updated_version,
-    }
+def _write_update_check_state(app_id, state):
     try:
         path = _update_check_state_path(app_id)
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -2056,6 +2183,90 @@ def run_update_check_once(app):
             json.dump(state, f)
     except OSError:
         pass
+
+
+def run_update_check_once(app, allow_auto=True):
+    """Einmaliger Versions-Check fuer EINE App, Ergebnis wird zwischen-
+    gespeichert (per Timer regelmaessig aufgerufen, siehe --check-update).
+    allow_auto=False: nur Status auffrischen, nie selbst installieren (fuer
+    Aufrufe aus dem Webserver nach einem manuellen Update)."""
+    app_id = app["id"]
+    current = app_version(app)
+    release = fetch_latest_release(app)
+    update_available = bool(release) and parse_version(release["tag"]) > parse_version(current)
+    # Vorherigen Zustand fortschreiben statt neu anzulegen - sonst gingen
+    # last_ping_date/auto_install (von anderen Prozessen geschrieben) verloren.
+    state = read_update_check_state(app)
+    auto_updated_version = state.get("auto_updated_version")
+    auto_update_due_at = None
+    if update_available and get_auto_update(app_id) and release.get("tarball_url"):
+        due_at, _urgent = auto_update_due(app, current, fetch_all_releases(app) or [release])
+        if allow_auto and (due_at is None or time.time() >= due_at):
+            ok, detail = perform_update(app, release["tarball_url"], release["tag"])
+            _update_state(app_id).update(done=True, ok=ok, detail=detail)
+            if ok:
+                current = app_version(app)
+                update_available = False
+                auto_updated_version = current
+                if get_auto_install_sh(app_id) and install_sh_changed(app, release["tag"]):
+                    _start_auto_install_sh(app)
+        else:
+            auto_update_due_at = due_at
+    state.update({
+        "current": current,
+        "latest": release["tag"] if release else None,
+        "update_available": update_available,
+        "checked_at": time.strftime("%Y-%m-%d %H:%M"),
+        "notes": (release.get("notes") if release else None),
+        "auto_updated_version": auto_updated_version,
+        "auto_update_due_at": auto_update_due_at,
+    })
+    _write_update_check_state(app_id, state)
+
+
+def _start_auto_install_sh(app):
+    """Startet den automatischen Komplett-Lauf als EIGENE transiente systemd-
+    Einheit und kehrt sofort zurueck. Nicht direkt hier ausfuehren: dieser
+    Code laeuft im <app>-update-check.service, und install.sh der Apps ruft
+    am Ende selbst 'systemctl start <app>-update-check.service' auf - das
+    wartet auf den gerade laufenden Dienst, der wiederum auf install.sh
+    wartet (Deadlock bis zum Timeout). Entkoppelt ist der Check-Dienst
+    laengst beendet, wenn install.sh ihn neu startet."""
+    unit = "setup-portal-install-" + re.sub(r"[^A-Za-z0-9_-]", "_", app["id"])
+    result = subprocess.run(
+        ["systemd-run", "--no-block", "--collect", f"--unit={unit}",
+         sys.executable, os.path.abspath(__file__), "--auto-install-sh", app["id"]],
+        capture_output=True, text=True)
+    if result.returncode != 0:
+        _record_auto_install_result(app, False, "Komplett-Update konnte nicht gestartet werden: "
+                                    + (result.stderr or result.stdout or "").strip()[-300:])
+
+
+def _record_auto_install_result(app, ok, detail):
+    """Ergebnis des automatischen Komplett-Laufs fuer die Update-Seite merken.
+    Bei Fehlschlag wird die Automatik fuer diese App abgeschaltet, damit ein
+    kaputtes install.sh nicht jede Nacht erneut versucht wird - der Button
+    "Komplett von GitHub aktualisieren" bleibt als manueller Weg."""
+    if not ok:
+        set_auto_install_sh(app["id"], False)
+    state = read_update_check_state(app)
+    state["auto_install"] = {"ok": ok, "detail": detail, "at": time.strftime("%Y-%m-%d %H:%M")}
+    _write_update_check_state(app["id"], state)
+
+
+def run_auto_install_sh(app):
+    """CLI --auto-install-sh, gestartet von _start_auto_install_sh()."""
+    try:
+        ok, detail, install_sh_hash = _download_and_run_install_script(
+            app["update"]["github_repo"], app.get("install_script_path", "setup/install.sh"), app["label"])
+        if ok and install_sh_hash:
+            _write_installed_install_sh_hash(app["id"], install_sh_hash)
+    except subprocess.TimeoutExpired:
+        ok, detail = False, "Ausführung hat zu lange gedauert (Timeout)."
+    except Exception as e:
+        ok, detail = False, f"Unerwarteter Fehler: {e}"
+    _record_auto_install_result(app, ok, detail)
+    print(detail, file=sys.stderr)
 
 
 def perform_update(app, tarball_url, target_tag):
@@ -2138,7 +2349,7 @@ def _run_update_in_background(app):
             return
         ok, detail = perform_update(app, release["tarball_url"], release["tag"])
         _update_state(app_id).update(done=True, ok=ok, detail=detail)
-        run_update_check_once(app)
+        run_update_check_once(app, allow_auto=False)
     except Exception as e:
         _update_state(app_id).update(done=True, ok=False, detail=f"Unerwarteter Fehler: {e}")
 
@@ -2160,7 +2371,7 @@ def _run_version_switch_in_background(app, tag):
             detail += (" Automatische Updates wurden dabei ausgeschaltet, damit der Pi nicht "
                        "gleich wieder auf die neuere Version zurueckaktualisiert.")
         _update_state(app_id).update(done=True, ok=ok, detail=detail)
-        run_update_check_once(app)
+        run_update_check_once(app, allow_auto=False)
     except Exception as e:
         _update_state(app_id).update(done=True, ok=False, detail=f"Unerwarteter Fehler: {e}")
 
@@ -2177,7 +2388,7 @@ def _run_update_all_in_background():
                 results.append(f"{app['label']}: neueste Version konnte nicht ermittelt werden.")
                 continue
             ok, detail = perform_update(app, release["tarball_url"], release["tag"])
-            run_update_check_once(app)
+            run_update_check_once(app, allow_auto=False)
             overall_ok = overall_ok and ok
             results.append(f"{app['label']}: {detail}")
         UPDATE_STATE["_all"] = {"done": True, "ok": overall_ok, "detail": " / ".join(results) or "Keine Anwendung registriert."}
@@ -2280,7 +2491,9 @@ def render_update_card(app, message=""):
     app_id = app["id"]
     current = app_version(app)
     release = fetch_latest_release(app)
-    install_sh_changed = False
+    all_releases = fetch_all_releases(app)
+    sh_changed = False
+    auto_hint = ""
     if release is None:
         latest = "konnte nicht abgerufen werden"
         status_class = "err"
@@ -2302,11 +2515,16 @@ def render_update_card(app, message=""):
             # Zweifel lieber einmal zu oft auf "Komplett aktualisieren"
             # hinweisen als das genau hier aufgetretene Muster (Update kam
             # nie an, weil install.sh nie erneut lief) unbemerkt zu lassen.
-            install_script_path = app.get("install_script_path", "setup/install.sh")
-            raw_install_sh = _fetch_raw_file(app["update"]["github_repo"], latest, install_script_path)
-            if raw_install_sh is not None:
-                neuer_hash = hashlib.sha256(raw_install_sh).hexdigest()
-                install_sh_changed = neuer_hash != _read_installed_install_sh_hash(app_id)
+            sh_changed = install_sh_changed(app, latest)
+            if get_auto_update(app_id):
+                due_at, urgent = auto_update_due(app, current, all_releases or [release])
+                if urgent:
+                    auto_hint = "Dringendes Update - wird beim nächsten nächtlichen Check automatisch installiert."
+                elif due_at is not None:
+                    auto_hint = ("Automatische Installation frühestens in der Nacht nach dem "
+                                 + time.strftime("%d.%m.%Y", time.localtime(max(due_at, time.time())))
+                                 + " (Updates werden gestaffelt verteilt, damit nicht alle Geräte gleichzeitig "
+                                 "aktualisieren). Sofort geht's mit dem Button.")
             action_block = (
                 f'<form onsubmit="return startUpdate(\'{app_id}\', \'{latest}\')">'
                 f'<button type="submit" class="btn-danger">⬇ Auf {latest} aktualisieren</button>'
@@ -2315,7 +2533,18 @@ def render_update_card(app, message=""):
         else:
             action_block = '<p class="muted">Du hast bereits die neueste Version.</p>'
 
-    all_releases = fetch_all_releases(app)
+    auto_install_sh_on = get_auto_install_sh(app_id)
+    last_auto_install = read_update_check_state(app).get("auto_install") or {}
+    if last_auto_install.get("detail"):
+        ai_ok = last_auto_install.get("ok")
+        auto_install_block = (
+            f'<div class="msg {"ok" if ai_ok else "err"}" style="font-size:.85rem; margin-top:1rem;">'
+            f'{"✅" if ai_ok else "❌"} Automatisches Komplett-Update ({html.escape(last_auto_install.get("at") or "")}): '
+            f'{html.escape(last_auto_install["detail"])}'
+            + ("" if ai_ok else "<br>Die Automatik dafür wurde abgeschaltet - nach Klärung unten wieder einschalten.")
+            + '</div>')
+    else:
+        auto_install_block = ""
     if all_releases:
         version_options = "".join(
             f'<option value="{html.escape(r["tag"])}" {"selected" if r["tag"] == current else ""}>'
@@ -2348,6 +2577,7 @@ def render_update_card(app, message=""):
 <strong>Installierte Version:</strong> {current}<br>
 <strong>Neueste Version:</strong> {latest}
 </div>
+{f'<p class="muted" style="font-size:.85rem;">{html.escape(auto_hint)}</p>' if auto_hint else ''}
 {notes_block}
 {action_block}
 
@@ -2365,18 +2595,25 @@ werden dabei ausgeschaltet, falls es ein Rueckschritt ist):</p>
     <input type="checkbox" name="auto_update" value="1" {"checked" if get_auto_update(app_id) else ""} style="width:auto; margin:0;">
     Automatisch aktualisieren, sobald eine neue Version verfügbar ist
   </label>
+  <label style="display:flex; align-items:center; gap:.5rem; font-weight:normal;">
+    <input type="checkbox" name="auto_install_sh" value="1" {"checked" if auto_install_sh_on else ""} style="width:auto; margin:0;">
+    Bei Bedarf automatisch komplett von GitHub aktualisieren (wenn sich install.sh geändert hat)
+  </label>
   <button type="submit" class="btn-small">Einstellung speichern</button>
 </form>
 
+{auto_install_block}
 {f'''<div class="msg err" style="margin-top:1rem;">
 ⚠️ <strong>install.sh</strong> hat sich seit der letzten vollständigen Installation geändert (oder es gibt noch
-keinen Vergleichswert). Ein normales Update reicht dann evtl. nicht - bitte stattdessen den Button
-"Komplett von GitHub aktualisieren" nutzen.
-</div>''' if install_sh_changed else ''}
+keinen Vergleichswert). Ein normales Update reicht dann evtl. nicht - '''
+ + ('das automatische Update holt die Komplett-Aktualisierung gleich mit nach, oder sofort per Button'
+    if get_auto_update(app_id) and auto_install_sh_on else
+    'bitte stattdessen den Button "Komplett von GitHub aktualisieren" nutzen') + '''.
+</div>''' if sh_changed else ''}
 <p class="muted" style="font-size:.85rem; margin-top:1rem;">Ein normales Update kopiert nur die
 App-eigenen Dateien - Änderungen an <code>install.sh</code> selbst (z. B. neue Setup-Funktionen,
 Descriptor-Änderungen) werden dabei NICHT übernommen. Falls nötig, hier ohne SSH nachholen:</p>
-<button type="button" class="{'btn-danger' if install_sh_changed else 'btn-small'}" onclick="return startInstallRun('{app_id}')">🔄 Komplett von GitHub aktualisieren</button>
+<button type="button" class="{'btn-danger' if sh_changed else 'btn-small'}" onclick="return startInstallRun('{app_id}')">🔄 Komplett von GitHub aktualisieren</button>
 {changelog_block}
 </div>"""
 
@@ -2890,6 +3127,8 @@ class BaseHandler(BaseHTTPRequestHandler):
             fields = parse_qs(self.rfile.read(length).decode("utf-8"))
             enabled = fields.get("auto_update", [""])[0] == "1"
             ok, detail = set_auto_update(app["id"], enabled)
+            if ok:
+                ok, detail = set_auto_install_sh(app["id"], fields.get("auto_install_sh", [""])[0] == "1")
             msg = (f'<div class="msg ok">✅ {detail}</div>' if ok else f'<div class="msg err">{detail}</div>')
             self._send_html(render_update_overview(msg))
             return
@@ -2950,7 +3189,15 @@ if __name__ == "__main__":
         if not app:
             print(f"Keine registrierte App mit ID '{app_id}' gefunden (apps.d/{app_id}.json fehlt?).", file=sys.stderr)
             sys.exit(1)
+        send_stats_ping(app)
         run_update_check_once(app)
+    elif "--auto-install-sh" in sys.argv:
+        idx = sys.argv.index("--auto-install-sh")
+        app = get_app(sys.argv[idx + 1]) if len(sys.argv) > idx + 1 else None
+        if not app:
+            print("Nutzung: setup_portal.py --auto-install-sh <registrierte app-id>", file=sys.stderr)
+            sys.exit(1)
+        run_auto_install_sh(app)
     elif "--self-update" in sys.argv:
         _self_update()
     else:
