@@ -116,7 +116,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote
 
-PORTAL_VERSION = "1.8.11"
+PORTAL_VERSION = "1.8.12"
 
 PORTAL_DIR = "/opt/setup-portal"
 # Jede App legt hier per eigenem install.sh genau eine Datei <app-id>.json
@@ -314,6 +314,7 @@ PAGE_LANDING = """<!doctype html>
 <strong>IP-Adressen:</strong><br>
 {ip_lines}
 </div>
+{stats_line}
 {system_buttons}
 {donate_section}
 
@@ -1907,6 +1908,117 @@ def send_stats_ping(app):
     _write_update_check_state(app["id"], state)
 
 
+# Taeglicher Zaehlerstand (download_count) je Repo, {repo: {"JJJJ-MM-TT":
+# Stand}} - app-uebergreifend in EINER Datei, weil auch die Partner-App
+# (companion) mitgezaehlt wird, ohne hier installiert zu sein.
+STATS_HISTORY_PATH = os.path.join(STATE_DIR, "_stats_history.json")
+STATS_HISTORY_DAYS = 30
+
+
+def _stats_repos(apps):
+    """[(Label, Repo)] aller installierten Apps plus ihrer Partner-Apps,
+    ohne Doppelte, in stabiler Reihenfolge."""
+    repos = []
+    for app in apps:
+        repos.append((app["label"], app["update"]["github_repo"]))
+        comp = app.get("companion")
+        if comp and comp.get("github_repo"):
+            repos.append((comp["label"], comp["github_repo"]))
+    seen, result = set(), []
+    for label, repo in repos:
+        if repo not in seen:
+            seen.add(repo)
+            result.append((label, repo))
+    return result
+
+
+def _read_stats_history():
+    try:
+        with open(STATS_HISTORY_PATH) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def record_stats_snapshot():
+    """Hoechstens einmal pro Tag und Repo den aktuellen download_count
+    merken (laeuft im naechtlichen --check-update jeder App - mehrere Apps
+    auf einem Geraet loesen also trotzdem nur einen Eintrag pro Tag aus).
+    Feste Uhrzeit ist nicht noetig: der Timer laeuft jeden Tag zur selben
+    Zeit, die Differenz zweier Staende umfasst damit immer etwa einen Tag."""
+    history = _read_stats_history()
+    today = time.strftime("%Y-%m-%d")
+    changed = False
+    for _label, repo in _stats_repos(load_apps()):
+        per_repo = history.setdefault(repo, {})
+        if today in per_repo:
+            continue
+        try:
+            req = urllib.request.Request(
+                f"https://api.github.com/repos/{repo}/releases/tags/{STATS_RELEASE_TAG}",
+                headers={"Accept": "application/vnd.github+json", "User-Agent": "Pi-Setup-Update-Check"},
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            count = next((a.get("download_count") for a in data.get("assets", [])
+                          if a.get("name") == STATS_ASSET_NAME), None)
+        except (urllib.error.URLError, OSError, json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(count, int):
+            continue
+        per_repo[today] = count
+        for old in sorted(per_repo)[:-STATS_HISTORY_DAYS]:
+            del per_repo[old]
+        changed = True
+    if not changed:
+        return
+    # Temp-Datei + umbenennen: zwei Apps pruefen nachts fast gleichzeitig.
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        tmp = f"{STATS_HISTORY_PATH}.{os.getpid()}.tmp"
+        with open(tmp, "w") as f:
+            json.dump(history, f)
+        os.replace(tmp, STATS_HISTORY_PATH)
+    except OSError:
+        pass
+
+
+def active_installations(per_repo, days=7):
+    """Durchschnittliche Pings pro Tag ueber (hoechstens) die letzten 'days'
+    Tage = ungefaehre Zahl aktiver Installationen. None, solange es weniger
+    als zwei Staende gibt oder der Zaehler noch 0 ist (dann zaehlt GitHub
+    entweder nicht, oder es gibt schlicht noch keine Daten)."""
+    points = sorted(per_repo.items())
+    if len(points) < 2 or points[-1][1] <= 0:
+        return None
+    newest_date, newest = points[-1]
+    newest_t = time.mktime(time.strptime(newest_date, "%Y-%m-%d"))
+    start_date, start = points[0]
+    for d, c in points:
+        if newest_t - time.mktime(time.strptime(d, "%Y-%m-%d")) <= days * 86400:
+            start_date, start = d, c
+            break
+    span_days = round((newest_t - time.mktime(time.strptime(start_date, "%Y-%m-%d"))) / 86400)
+    if span_days <= 0:
+        start_date, start = points[-2]
+        span_days = max(1, round((newest_t - time.mktime(time.strptime(start_date, "%Y-%m-%d"))) / 86400))
+    return max(0, round((newest - start) / span_days))
+
+
+def render_stats_line(apps):
+    history = _read_stats_history()
+    parts = []
+    for label, repo in _stats_repos(apps):
+        n = active_installations(history.get(repo, {}))
+        if n is not None:
+            parts.append(f"{html.escape(label)}: {n}")
+    if not parts:
+        return ""
+    return ('<p class="muted" style="text-align:center; font-size:.75rem; margin:.4rem 0 0;">'
+            f'📊 Aktive Installationen (Ø 7 Tage) – {" · ".join(parts)}</p>')
+
+
 def app_version(app):
     try:
         with open(app["update"]["version_file"]) as f:
@@ -2751,6 +2863,7 @@ def render_landing(request_host=None):
         ip_lines=ip_lines,
         system_buttons=SYSTEM_BUTTONS if IS_PI else "",
         donate_section=donate_section,
+        stats_line=render_stats_line(apps),
     )
 
 
@@ -3190,6 +3303,7 @@ if __name__ == "__main__":
             print(f"Keine registrierte App mit ID '{app_id}' gefunden (apps.d/{app_id}.json fehlt?).", file=sys.stderr)
             sys.exit(1)
         send_stats_ping(app)
+        record_stats_snapshot()
         run_update_check_once(app)
     elif "--auto-install-sh" in sys.argv:
         idx = sys.argv.index("--auto-install-sh")
