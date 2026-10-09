@@ -116,7 +116,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote
 
-PORTAL_VERSION = "1.8.12"
+PORTAL_VERSION = "1.8.13"
 
 PORTAL_DIR = "/opt/setup-portal"
 # Jede App legt hier per eigenem install.sh genau eine Datei <app-id>.json
@@ -921,6 +921,10 @@ setTimeout(function() {
 #     (siehe render_landing()/_run_companion_install_in_background()).
 #   "beschreibung": kurzer Text, was die App macht - erscheint auf /hilfe
 #     (siehe render_app_beschreibungen()).
+#   "busy_check": {"json_file", "key"} - JSON-Datei der App mit einem Bool-Feld;
+#     ist es wahr (z. B. Tuer offen = Foto-Zyklus laeuft), startet die nachtliche
+#     Auto-Reparatur (install.sh) in dieser Nacht nicht (siehe
+#     app_is_busy()/run_update_check_once()).
 _REQUIRED_TOP_LEVEL_FIELDS = (
     "id", "label", "emoji", "app_port_default", "app_port_env_file", "app_port_env_var",
     "backup", "update",
@@ -1787,6 +1791,39 @@ def install_sh_changed(app, tag):
     return hashlib.sha256(raw_install_sh).hexdigest() != _read_installed_install_sh_hash(app["id"])
 
 
+def install_sh_out_of_sync(app):
+    """True, wenn die INSTALLIERTE Version ein anderes install.sh mitbringt als
+    das, mit dem zuletzt vollstaendig installiert wurde - klassischer Fall:
+    ein normales (file_map-)Update lief, install.sh aber nie (neue Pakete/
+    Timer/Descriptor-Felder fehlen dann). Anders als install_sh_changed() NIE
+    True bei fehlendem Vergleichswert (z. B. frische Erstinstallation per SSH,
+    die keinen Hash schreibt) - sonst warnte jede neue Installation sofort
+    faelschlich - und NIE True, wenn install.sh nicht abrufbar ist."""
+    gespeichert = _read_installed_install_sh_hash(app["id"])
+    version = app_version(app)
+    if not gespeichert or version == "?":
+        return False
+    raw = _fetch_raw_file(app["update"]["github_repo"], version,
+                          app.get("install_script_path", "setup/install.sh"))
+    if raw is None:
+        return False
+    return hashlib.sha256(raw).hexdigest() != gespeichert
+
+
+def app_is_busy(app):
+    """True, wenn die App per optionalem Descriptor-Feld 'busy_check' meldet,
+    dass sie gerade arbeitet (z. B. HonigBox: Tuer offen). Fehlendes Feld,
+    fehlende/kaputte Datei = nicht beschaeftigt."""
+    check = app.get("busy_check")
+    if not isinstance(check, dict):
+        return False
+    try:
+        with open(check["json_file"]) as f:
+            return bool(json.load(f).get(check["key"]))
+    except (OSError, KeyError, TypeError, json.JSONDecodeError, AttributeError):
+        return False
+
+
 # Gestaffelte Verteilung automatischer Updates, siehe auto_update_due().
 ROLLOUT_WINDOW_DAYS = 14
 # Steht dieser Text (Gross-/Kleinschreibung egal) im Release-Text, gilt fuer
@@ -2324,6 +2361,14 @@ def run_update_check_once(app, allow_auto=True):
                     _start_auto_install_sh(app)
         else:
             auto_update_due_at = due_at
+    elif (allow_auto and not update_available and release
+          and get_auto_install_sh(app_id) and not app_is_busy(app)
+          and install_sh_out_of_sync(app)):
+        # Version aktuell, aber install.sh lief seit dem Update nie (z. B. nach
+        # einem manuellen "normalen" Update): Komplett-Lauf nachholen. Scheitert
+        # er, schaltet _record_auto_install_result() die Automatik ab - keine
+        # naechtliche Schleife; gelingt er, wird der Hash geschrieben.
+        _start_auto_install_sh(app)
     state.update({
         "current": current,
         "latest": release["tag"] if release else None,
@@ -2605,6 +2650,7 @@ def render_update_card(app, message=""):
     release = fetch_latest_release(app)
     all_releases = fetch_all_releases(app)
     sh_changed = False
+    sh_out_of_sync = False
     auto_hint = ""
     if release is None:
         latest = "konnte nicht abgerufen werden"
@@ -2644,6 +2690,11 @@ def render_update_card(app, message=""):
             )
         else:
             action_block = '<p class="muted">Du hast bereits die neueste Version.</p>'
+            if install_sh_out_of_sync(app):
+                sh_changed = True
+                sh_out_of_sync = True
+                action_block = ('<p class="muted">Version ist aktuell, aber das Setup ist unvollständig - '
+                                'siehe Hinweis unten.</p>')
 
     auto_install_sh_on = get_auto_install_sh(app_id)
     last_auto_install = read_update_check_state(app).get("auto_install") or {}
@@ -2716,12 +2767,20 @@ werden dabei ausgeschaltet, falls es ein Rueckschritt ist):</p>
 
 {auto_install_block}
 {f'''<div class="msg err" style="margin-top:1rem;">
+⚠️ <strong>Setup unvollständig:</strong> <strong>install.sh</strong> hat sich seit der letzten vollständigen
+Installation geändert (z. B. neue Pakete, Zeitgeber oder Dienste), ist nach dem Update aber nicht gelaufen.
+Neue Funktionen können deshalb ohne Wirkung bleiben - '''
+ + ('das wird heute Nacht automatisch nachgeholt, oder sofort per Button'
+    if auto_install_sh_on else
+    'bitte den Button "Komplett von GitHub aktualisieren" nutzen') + '''.
+</div>''' if sh_out_of_sync else ''}
+{f'''<div class="msg err" style="margin-top:1rem;">
 ⚠️ <strong>install.sh</strong> hat sich seit der letzten vollständigen Installation geändert (oder es gibt noch
 keinen Vergleichswert). Ein normales Update reicht dann evtl. nicht - '''
  + ('das automatische Update holt die Komplett-Aktualisierung gleich mit nach, oder sofort per Button'
     if get_auto_update(app_id) and auto_install_sh_on else
     'bitte stattdessen den Button "Komplett von GitHub aktualisieren" nutzen') + '''.
-</div>''' if sh_changed else ''}
+</div>''' if sh_changed and not sh_out_of_sync else ''}
 <p class="muted" style="font-size:.85rem; margin-top:1rem;">Ein normales Update kopiert nur die
 App-eigenen Dateien - Änderungen an <code>install.sh</code> selbst (z. B. neue Setup-Funktionen,
 Descriptor-Änderungen) werden dabei NICHT übernommen. Falls nötig, hier ohne SSH nachholen:</p>
