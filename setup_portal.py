@@ -123,7 +123,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote
 
-PORTAL_VERSION = "1.8.16"
+PORTAL_VERSION = "1.8.17"
 
 PORTAL_DIR = "/opt/setup-portal"
 # Jede App legt hier per eigenem install.sh genau eine Datei <app-id>.json
@@ -383,7 +383,7 @@ USB_MOUNT = "/mnt/backup-usb"
 STYLE = """
   :root {{
     --bg: #faf6ee; --fg: #241f17; --muted: #6e6353; --box-bg: #ece3d2;
-    --msg-ok-bg: #dfd; --msg-err-bg: #fdd;
+    --msg-ok-bg: #dfd; --msg-err-bg: #fdd; --msg-warn-bg: #fdf0c8;
     --input-bg: #fff; --input-border: #ece3d2;
     --btn-bg: #d98e04; --btn-fg: #fff; --btn-active: #b87503;
     --danger-bg: #c92a2a; --danger-fg: #fff; --danger-active: #a02020;
@@ -392,7 +392,7 @@ STYLE = """
   @media (prefers-color-scheme: dark) {{
     :root {{
       --bg: #15120d; --fg: #efe7d8; --muted: #b0a48d; --box-bg: #211c15;
-      --msg-ok-bg: #17301d; --msg-err-bg: #3a1c1c;
+      --msg-ok-bg: #17301d; --msg-err-bg: #3a1c1c; --msg-warn-bg: #3a3017;
       --input-bg: #211c15; --input-border: #352d22;
       --btn-bg: #eaa92a; --btn-fg: #1a1a1a; --btn-active: #c9901a;
       --danger-bg: #ff6b6b; --danger-fg: #1a1a1a; --danger-active: #e05555;
@@ -433,6 +433,25 @@ STYLE = """
   .muted {{ color: var(--muted); }}
   .app-section {{ text-align: left; }}
   .app-section h2 {{ margin-top: 0; }}
+  .warn {{ background: var(--msg-warn-bg); }}
+  .small {{ font-size: .85rem; }}
+  .ver-line {{ display: flex; flex-wrap: wrap; align-items: center; gap: .4rem .6rem; }}
+  .pill {{ display: inline-block; padding: .15rem .55rem; border-radius: 999px; font-size: .8rem;
+           font-weight: bold; }}
+  .pill-ok {{ background: var(--msg-ok-bg); }}
+  .pill-warn {{ background: var(--msg-warn-bg); }}
+  .pill-err {{ background: var(--msg-err-bg); }}
+  .btn-quiet {{ background: transparent; color: var(--fg); border: 1px solid var(--muted); font-weight: normal; }}
+  .btn-quiet:active {{ background: var(--input-border); }}
+  details.notes, details.more {{ margin-top: .9rem; }}
+  details > summary {{ cursor: pointer; color: var(--muted); }}
+  details.more[open] > summary {{ margin-bottom: .3rem; }}
+  details.more h3 {{ font-size: .9rem; margin: 1.1rem 0 .3rem; }}
+  details.more form button {{ margin-top: .6rem; }}
+  .notes-text {{ white-space: pre-wrap; font-size: .85rem; margin-top: .4rem; }}
+  .changelog-item {{ margin-bottom: .9rem; font-size: .85rem; }}
+  label.check {{ display: flex; align-items: flex-start; gap: .5rem; font-weight: normal; margin-top: .6rem; }}
+  label.check input {{ width: auto; margin: .2rem 0 0; }}
   .donate-box {{ margin-top: 1.2rem; padding-top: 1rem; border-top: 1px solid var(--input-border);
                   text-align: center; }}
   .donate-box p {{ color: var(--muted); font-size: .85rem; margin: 0 0 .6rem; }}
@@ -938,8 +957,8 @@ PAGE_UPDATE = """<!doctype html>
 <h1>🔄 Update</h1>
 {message}
 {run_status}
+{summary}
 {app_sections}
-{all_update_button}
 {self_update_card}
 <a class="btn" href="/">← Zurück zur Übersicht</a>
 
@@ -1092,8 +1111,12 @@ function startInstallRun(appId) {{
 function updateVersionSwitchButton(select, appId) {{
   var btn = document.getElementById('version-switch-btn-' + appId);
   var isCurrent = select.value === select.dataset.current;
+  var opt = select.options[select.selectedIndex];
+  var isOlder = !!(opt && opt.dataset.older);
   btn.disabled = isCurrent;
-  btn.classList.toggle('btn-danger', !isCurrent);
+  btn.classList.toggle('btn-danger', isOlder);
+  btn.classList.toggle('btn-quiet', !isOlder);
+  btn.textContent = isOlder ? 'Auf ältere Version zurückwechseln' : 'Version installieren';
   btn.style.opacity = isCurrent ? '.5' : '1';
 }}
 document.querySelectorAll('select[data-app-id]').forEach(function(sel) {{
@@ -2398,7 +2421,7 @@ def _write_self_update_state(done, ok=None, detail=None):
     try:
         os.makedirs(STATE_DIR, exist_ok=True)
         with open(SELF_UPDATE_CHECK_STATE_PATH, "w") as f:
-            json.dump({"done": done, "ok": ok, "detail": detail}, f)
+            json.dump({"done": done, "ok": ok, "detail": detail, "at": time.strftime("%d.%m. %H:%M")}, f)
     except OSError:
         pass  # Anzeige bleibt dann einfach beim vorherigen Stand bzw. "laeuft" haengen
 
@@ -2990,169 +3013,184 @@ def _run_install_script_in_background(app):
         _set_update_state(app_id, done=True, ok=False, detail=f"Unerwarteter Fehler: {e}")
 
 
-def render_update_card(app, message=""):
+def _version_pill(text, kind):
+    """Kleine Status-Marke neben der installierten Version (kind: ok/warn/err)."""
+    return f'<span class="pill pill-{kind}">{html.escape(text)}</span>'
+
+
+def render_update_card(app):
+    """Eine Karte pro App. Aufbau seit v1.8.17 (vorher: viele rote Buttons
+    und Hinweise gleichzeitig, schwer zu ueberblicken): oben Version +
+    Status, darunter genau die EINE Aktion, die gerade sinnvoll ist (Update
+    bzw. Setup nachholen). Rot nur noch fuer echte Fehler. Alles Seltene
+    (Automatik, Versionswechsel, Komplett-Lauf, Verlauf) steckt eingeklappt
+    unter "Weitere Optionen". Gibt (html, neue Version oder None) zurueck -
+    render_update_overview() baut daraus die Zusammenfassung oben."""
     app_id = app["id"]
     current = app_version(app)
     release = fetch_latest_release(app)
     all_releases = fetch_all_releases(app)
-    sh_changed = False
-    sh_out_of_sync = False
-    auto_hint = ""
+    auto_update_on = get_auto_update(app_id)
+    auto_install_sh_on = get_auto_install_sh(app_id)
+    update_tag = None
+    blocks = []
+
     if release is None:
-        latest = "konnte nicht abgerufen werden"
-        status_class = "err"
-        notes_block = ""
-        action_block = '<p class="muted">Prüfe, ob der Pi Internetzugang hat, und lade die Seite neu.</p>'
+        pill = _version_pill("GitHub nicht erreichbar", "err")
+        blocks.append('<p class="muted small">Neueste Version konnte nicht abgerufen werden - '
+                      'hat das Gerät Internet? Seite später neu laden.</p>')
     else:
         latest = release["tag"]
-        update_available = parse_version(latest) > parse_version(current)
-        status_class = "err" if update_available else "ok"
-        notes_block = (f'<div class="msg" style="white-space:pre-wrap;">{html.escape(release["notes"])}</div>'
-                       if update_available and release["notes"] else "")
-        if update_available:
-            # Ob ein normales (file_map-basiertes) Update ausreicht, oder ob
-            # sich install.sh selbst seit dem letzten VOLLSTAENDIGEN Lauf
-            # geaendert hat (dann wuerden apt-Pakete/systemd-Dienste/
-            # Descriptor-Aenderungen NICHT ankommen, siehe perform_update()).
-            # Kein gespeicherter Vergleichs-Hash (nie ueber diesen Mechanismus
-            # voll installiert) zaehlt bewusst auch als "geaendert" - im
-            # Zweifel lieber einmal zu oft auf "Komplett aktualisieren"
-            # hinweisen als das genau hier aufgetretene Muster (Update kam
-            # nie an, weil install.sh nie erneut lief) unbemerkt zu lassen.
-            sh_changed = install_sh_changed(app, latest)
-            if get_auto_update(app_id):
+        if parse_version(latest) > parse_version(current):
+            update_tag = latest
+            pill = _version_pill(f"{latest} verfügbar", "warn")
+            if release["notes"]:
+                blocks.append(f'<details class="notes"><summary>Was ist neu in {html.escape(latest)}?</summary>'
+                              f'<div class="notes-text">{html.escape(release["notes"])}</div></details>')
+            blocks.append(f'<form onsubmit="return startUpdate(\'{app_id}\', \'{latest}\')">'
+                          f'<button type="submit">⬇ Auf {html.escape(latest)} aktualisieren</button></form>')
+            hints = []
+            if auto_update_on:
                 due_at, urgent = auto_update_due(app, current, all_releases or [release])
                 if urgent:
-                    auto_hint = "Dringendes Update - wird beim nächsten nächtlichen Check automatisch installiert."
+                    hints.append("Dringendes Update - kommt beim nächsten nächtlichen Check automatisch.")
                 elif due_at is not None:
-                    auto_hint = ("Automatische Installation frühestens in der Nacht nach dem "
-                                 + time.strftime("%d.%m.%Y", time.localtime(max(due_at, time.time())))
-                                 + " (Updates werden gestaffelt verteilt, damit nicht alle Geräte gleichzeitig "
-                                 "aktualisieren). Sofort geht's mit dem Button.")
-            action_block = (
-                f'<form onsubmit="return startUpdate(\'{app_id}\', \'{latest}\')">'
-                f'<button type="submit" class="btn-danger">⬇ Auf {latest} aktualisieren</button>'
-                f'</form>'
-            )
+                    hints.append("Kommt sonst automatisch, frühestens in der Nacht nach dem "
+                                 + time.strftime("%d.%m.", time.localtime(max(due_at, time.time())))
+                                 + " (Updates werden gestaffelt verteilt).")
+            # install.sh aendert sich mit: ein normales Update kopiert es nicht
+            # mit (siehe perform_update()). Kein gespeicherter Vergleichswert
+            # zaehlt bewusst als "geaendert", siehe install_sh_changed().
+            if install_sh_changed(app, latest):
+                hints.append("Diese Version ändert auch das Setup (install.sh). "
+                             + ("Das holt die Box nach dem Update nachts automatisch nach."
+                                if auto_install_sh_on else
+                                "Nach dem Update unter „Weitere Optionen“ einmal komplett aktualisieren."))
+            if hints:
+                blocks.append(f'<p class="muted small">{"<br>".join(html.escape(h) for h in hints)}</p>')
         else:
-            action_block = '<p class="muted">Du hast bereits die neueste Version.</p>'
             if install_sh_out_of_sync(app):
-                sh_changed = True
-                sh_out_of_sync = True
-                action_block = ('<p class="muted">Version ist aktuell, aber das Setup ist unvollständig - '
-                                'siehe Hinweis unten.</p>')
+                pill = _version_pill("Setup unvollständig", "warn")
+                blocks.append(
+                    '<div class="msg warn small">Die Version ist aktuell, aber das zugehörige Setup '
+                    '(install.sh: Pakete, Zeitpläne, Dienste) lief danach noch nicht. '
+                    + ("Das passiert heute Nacht automatisch - oder jetzt sofort:"
+                       if auto_install_sh_on else "Bitte jetzt nachholen:")
+                    + '</div>'
+                    f'<button type="button" onclick="return startInstallRun(\'{app_id}\')">🔄 Setup jetzt nachholen</button>')
+            else:
+                pill = _version_pill("aktuell", "ok")
 
-    auto_install_sh_on = get_auto_install_sh(app_id)
     last_auto_install = read_update_check_state(app).get("auto_install") or {}
-    if last_auto_install.get("detail"):
-        ai_ok = last_auto_install.get("ok")
-        auto_install_block = (
-            f'<div class="msg {"ok" if ai_ok else "err"}" style="font-size:.85rem; margin-top:1rem;">'
-            f'{"✅" if ai_ok else "❌"} Automatisches Komplett-Update ({html.escape(last_auto_install.get("at") or "")}): '
-            f'{html.escape(last_auto_install["detail"])}'
-            + ("" if ai_ok else "<br>Die Automatik dafür wurde abgeschaltet - nach Klärung unten wieder einschalten.")
-            + '</div>')
-    else:
-        auto_install_block = ""
+    if last_auto_install.get("detail") and not last_auto_install.get("ok"):
+        blocks.append(
+            f'<div class="msg err small">❌ Automatischer Komplett-Lauf '
+            f'({html.escape(last_auto_install.get("at") or "")}) fehlgeschlagen: '
+            f'{html.escape(last_auto_install["detail"])}<br>Die Automatik dafür ist deshalb aus - '
+            'nach Klärung unter „Weitere Optionen“ wieder einschalten.</div>')
+
+    # --- Weitere Optionen (eingeklappt) ---
     if all_releases:
         version_options = "".join(
-            f'<option value="{html.escape(r["tag"])}" {"selected" if r["tag"] == current else ""}>'
+            f'<option value="{html.escape(r["tag"])}"'
+            f'{" selected" if r["tag"] == current else ""}'
+            f'{" data-older=1" if parse_version(r["tag"]) < parse_version(current) else ""}>'
             f'{html.escape(r["tag"])}{" (installiert)" if r["tag"] == current else ""}</option>'
             for r in all_releases
         )
     else:
-        version_options = '<option value="">– keine Releases abrufbar –</option>'
-
+        version_options = '<option value="">– keine Versionen abrufbar –</option>'
     changelog_items = "".join(
-        f'<div style="margin-bottom:.9rem">'
-        f'<strong>{html.escape(r["tag"])}</strong>'
-        + (f' <span class="muted" style="font-size:.8rem">· {html.escape(r["published_at"][:10])}</span>' if r.get("published_at") else "")
-        + f'<div class="muted" style="white-space:pre-wrap;font-size:.85rem;margin-top:.2rem">{html.escape(r["notes"])}</div>'
-        f'</div>'
+        f'<div class="changelog-item"><strong>{html.escape(r["tag"])}</strong>'
+        + (f' <span class="muted">· {html.escape(r["published_at"][:10])}</span>' if r.get("published_at") else "")
+        + f'<div class="notes-text muted">{html.escape(r["notes"])}</div></div>'
         for r in all_releases if r.get("notes")
     )
-    changelog_block = (
-        f'<details style="margin-top:1rem">'
-        f'<summary class="muted" style="cursor:pointer">Änderungsverlauf früherer Versionen</summary>'
-        f'<div style="margin-top:.8rem">{changelog_items}</div>'
-        f'</details>'
-    ) if changelog_items else ""
+    auto_install_ok_line = ""
+    if last_auto_install.get("detail") and last_auto_install.get("ok"):
+        auto_install_ok_line = (f'<p class="muted small">Letzter automatischer Komplett-Lauf: '
+                                f'{html.escape(last_auto_install.get("at") or "")} ✅</p>')
 
-    return f"""
-<div class="msg app-section">
-<h2>{app['emoji']} {html.escape(app['label'])}</h2>
-{message}
-<div class="msg {status_class}">
-<strong>Installierte Version:</strong> {current}<br>
-<strong>Neueste Version:</strong> {latest}
-</div>
-{f'<p class="muted" style="font-size:.85rem;">{html.escape(auto_hint)}</p>' if auto_hint else ''}
-{notes_block}
-{action_block}
+    more = f"""
+<details class="more">
+<summary>Weitere Optionen</summary>
 
-<p class="muted" style="font-size:.85rem; margin-top:1rem;">Andere Version installieren (automatische Updates
-werden dabei ausgeschaltet, falls es ein Rueckschritt ist):</p>
+<h3>Automatik</h3>
+<form method="post" action="/update/settings/{app_id}">
+  <label class="check"><input type="checkbox" name="auto_update" value="1" {"checked" if auto_update_on else ""}>
+    Neue Versionen automatisch installieren (nachts)</label>
+  <label class="check"><input type="checkbox" name="auto_install_sh" value="1" {"checked" if auto_install_sh_on else ""}>
+    Geändertes Setup (install.sh) automatisch nachholen</label>
+  <button type="submit" class="btn-small btn-quiet">Einstellung speichern</button>
+</form>
+{auto_install_ok_line}
+
+<h3>Andere Version installieren</h3>
+<p class="muted small">Bei einem Rückschritt werden automatische Updates ausgeschaltet.</p>
 <form onsubmit="return startVersionSwitch(this, '{app_id}')">
-  <select name="tag" data-app-id="{app_id}" data-current="{current}" onchange="updateVersionSwitchButton(this, '{app_id}')">
+  <select name="tag" data-app-id="{app_id}" data-current="{html.escape(current)}" onchange="updateVersionSwitchButton(this, '{app_id}')">
     {version_options}
   </select>
-  <button type="submit" class="btn-danger" id="version-switch-btn-{app_id}">Version installieren</button>
+  <button type="submit" class="btn-small btn-quiet" id="version-switch-btn-{app_id}">Version installieren</button>
 </form>
 
-<form method="post" action="/update/settings/{app_id}" style="margin-top:1rem;">
-  <label style="display:flex; align-items:center; gap:.5rem; font-weight:normal;">
-    <input type="checkbox" name="auto_update" value="1" {"checked" if get_auto_update(app_id) else ""} style="width:auto; margin:0;">
-    Automatisch aktualisieren, sobald eine neue Version verfügbar ist
-  </label>
-  <label style="display:flex; align-items:center; gap:.5rem; font-weight:normal;">
-    <input type="checkbox" name="auto_install_sh" value="1" {"checked" if auto_install_sh_on else ""} style="width:auto; margin:0;">
-    Bei Bedarf automatisch komplett von GitHub aktualisieren (wenn sich install.sh geändert hat)
-  </label>
-  <button type="submit" class="btn-small">Einstellung speichern</button>
-</form>
+<h3>Komplett neu einrichten</h3>
+<p class="muted small">Ein normales Update kopiert nur die App-Dateien. Das hier lädt die neueste Version
+von GitHub und führt ihr <code>install.sh</code> aus (Pakete, Dienste, Zeitpläne) - ohne SSH.</p>
+<button type="button" class="btn-small btn-quiet" onclick="return startInstallRun('{app_id}')">🔄 Komplett von GitHub aktualisieren</button>
+{f'<h3>Änderungsverlauf</h3>{changelog_items}' if changelog_items else ''}
+</details>"""
 
-{auto_install_block}
-{f'''<div class="msg err" style="margin-top:1rem;">
-⚠️ <strong>Setup unvollständig:</strong> <strong>install.sh</strong> hat sich seit der letzten vollständigen
-Installation geändert (z. B. neue Pakete, Zeitgeber oder Dienste), ist nach dem Update aber nicht gelaufen.
-Neue Funktionen können deshalb ohne Wirkung bleiben - '''
- + ('das wird heute Nacht automatisch nachgeholt, oder sofort per Button'
-    if auto_install_sh_on else
-    'bitte den Button "Komplett von GitHub aktualisieren" nutzen') + '''.
-</div>''' if sh_out_of_sync else ''}
-{f'''<div class="msg err" style="margin-top:1rem;">
-⚠️ <strong>install.sh</strong> hat sich seit der letzten vollständigen Installation geändert (oder es gibt noch
-keinen Vergleichswert). Ein normales Update reicht dann evtl. nicht - '''
- + ('das automatische Update holt die Komplett-Aktualisierung gleich mit nach, oder sofort per Button'
-    if get_auto_update(app_id) and auto_install_sh_on else
-    'bitte stattdessen den Button "Komplett von GitHub aktualisieren" nutzen') + '''.
-</div>''' if sh_changed and not sh_out_of_sync else ''}
-<p class="muted" style="font-size:.85rem; margin-top:1rem;">Ein normales Update kopiert nur die
-App-eigenen Dateien - Änderungen an <code>install.sh</code> selbst (z. B. neue Setup-Funktionen,
-Descriptor-Änderungen) werden dabei NICHT übernommen. Falls nötig, hier ohne SSH nachholen:</p>
-<button type="button" class="{'btn-danger' if sh_changed else 'btn-small'}" onclick="return startInstallRun('{app_id}')">🔄 Komplett von GitHub aktualisieren</button>
-{changelog_block}
+    card = f"""
+<div class="msg app-section">
+<h2>{app['emoji']} {html.escape(app['label'])}</h2>
+<div class="ver-line">Installiert: <strong>{html.escape(current)}</strong> {pill}</div>
+{''.join(blocks)}
+{more}
 </div>"""
+    return card, update_tag
 
 
 def render_self_update_card():
-    """Zeigt zusaetzlich das Ergebnis des letzten Checks an (egal ob vom
-    taeglichen Timer oder manuell ausgeloest) - liest denselben Zustand,
-    den auch das Live-Polling nach einem Klick abfragt, siehe
-    read_self_update_check_state()."""
+    """Karte fuer das Portal selbst. Vergleicht seit v1.8.17 live mit GitHub
+    wie die App-Karten - vorher stand hier nur das gespeicherte Ergebnis des
+    letzten Checks, und das sagte z. B. "bereits die neueste Version
+    (v1.8.14)", obwohl inzwischen v1.8.16 erschienen war. Das gespeicherte
+    Ergebnis erscheint nur noch, wenn es etwas Eigenes sagt (Fehler,
+    aufgeschoben)."""
+    release = _fetch_latest_release_for_repo(SELF_UPDATE_GITHUB_REPO)
+    action = ""
+    if release is None:
+        pill_kind = "err"
+        pill = _version_pill("GitHub nicht erreichbar", "err")
+    elif parse_version(release["tag"]) > parse_version(PORTAL_VERSION):
+        pill_kind = "warn"
+        pill = _version_pill(f'{release["tag"]} verfügbar', "warn")
+        action = ('<p class="muted small">Kommt heute Nacht um 02:30 automatisch.</p>'
+                  f'<button type="button" onclick="return startSelfUpdateCheck()">⬇ Jetzt auf '
+                  f'{html.escape(release["tag"])} aktualisieren</button>')
+    else:
+        pill_kind = "ok"
+        pill = _version_pill("aktuell", "ok")
     state = read_self_update_check_state()
     status_line = ""
-    if state.get("done") and state.get("detail"):
-        cls = "ok" if state.get("ok") else "err"
-        icon = "✅" if state.get("ok") else "❌"
-        status_line = f'<div class="msg {cls}" style="font-size:.85rem;">{icon} {html.escape(state["detail"])}</div>'
+    # Nur solange noch etwas aussteht - ist das Portal aktuell, ist ein alter
+    # Fehlschlag/Aufschub erledigt. Gelb statt rot: meist nur "aufgeschoben".
+    if pill_kind != "ok" and state.get("done") and state.get("detail") and not state.get("ok"):
+        when = f' ({html.escape(state["at"])})' if state.get("at") else ""
+        status_line = f'<div class="msg warn small">ℹ️ Letzte Prüfung{when}: {html.escape(state["detail"])}</div>'
     return f"""
 <div class="msg app-section">
-<h2>🔧 Setup-Portal-Update</h2>
-<p class="muted">Version {PORTAL_VERSION}. Aktualisiert sich taeglich automatisch (02:30 Uhr) direkt aus den
-GitHub-Releases von <code>{html.escape(SELF_UPDATE_GITHUB_REPO)}</code> - unabhaengig von den Apps oben.</p>
+<h2>🔧 Setup-Portal</h2>
+<div class="ver-line">Installiert: <strong>v{PORTAL_VERSION}</strong> {pill}</div>
+{action}
 {status_line}
-<button type="button" class="btn-small" onclick="return startSelfUpdateCheck()">🔄 Jetzt auf neue Version prüfen</button>
+<details class="more">
+<summary>Weitere Optionen</summary>
+<p class="muted small">Das Portal aktualisiert sich jede Nacht um 02:30 selbst aus den GitHub-Releases von
+<code>{html.escape(SELF_UPDATE_GITHUB_REPO)}</code> - unabhängig von den Apps.</p>
+<button type="button" class="btn-small btn-quiet" onclick="return startSelfUpdateCheck()">🔄 Jetzt auf neue Version prüfen</button>
+</details>
 </div>"""
 
 
@@ -3212,26 +3250,32 @@ def render_run_status():
 
 def render_update_overview(message=""):
     apps = load_apps()
+    summary = ""
     if not apps:
         app_sections = '<p class="muted">Keine Anwendung registriert.</p>'
-        all_update_button = ""
     else:
-        app_sections = "".join(render_update_card(app) for app in apps)
-        if len(apps) > 1:
-            emojis = "".join(a["emoji"] for a in apps)
-            all_update_button = f'<form onsubmit="return startUpdateAll()"><button type="submit">{emojis} Alle aktualisieren</button></form>'
-        else:
-            all_update_button = ""
+        cards = [(app, *render_update_card(app)) for app in apps]
+        app_sections = "".join(card for _app, card, _tag in cards)
+        pending = [(app, tag) for app, _card, tag in cards if tag]
+        if len(pending) > 1:
+            # Nur wenn es wirklich mehr als ein Update gibt - bei einem reicht
+            # der Button in dessen Karte.
+            names = "<br>".join(f'{a["emoji"]} {html.escape(a["label"])}: {html.escape(t)}' for a, t in pending)
+            emojis = "".join(a["emoji"] for a, _t in pending)
+            summary = (f'<div class="msg app-section"><strong>⬆ {len(pending)} Updates verfügbar</strong>'
+                       f'<p class="small" style="margin:.4rem 0 0;">{names}</p>'
+                       f'<form onsubmit="return startUpdateAll()"><button type="submit">{emojis} Alle aktualisieren</button></form>'
+                       '</div>')
     run_status, run_status_js = render_run_status()
     return PAGE_UPDATE.format(
         header=render_header(),
         message=message,
         run_status=run_status,
+        summary=summary,
         run_status_js=run_status_js,
         can_reboot="true" if IS_PI else "false",
         long_running_hint=_js_literal(LONG_RUNNING_HINT),
         app_sections=app_sections,
-        all_update_button=all_update_button,
         self_update_card=render_self_update_card(),
     )
 
