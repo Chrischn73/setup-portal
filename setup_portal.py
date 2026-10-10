@@ -116,7 +116,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote
 
-PORTAL_VERSION = "1.8.13"
+PORTAL_VERSION = "1.8.14"
 
 PORTAL_DIR = "/opt/setup-portal"
 # Jede App legt hier per eigenem install.sh genau eine Datei <app-id>.json
@@ -331,8 +331,12 @@ function companionInstallPoll(appId, content) {{
     setTimeout(function() {{ window.location.reload(); }}, 3000);
   }}).catch(function() {{ setTimeout(function() {{ companionInstallPoll(appId, content); }}, 3000); }});
 }}
-function startCompanionInstall(hostAppId, companionAppId, companionLabel) {{
-  if (!confirm(companionLabel + ' jetzt automatisch von GitHub herunterladen und installieren?')) {{
+function startCompanionInstall(hostAppId, companionAppId, companionLabel, warning) {{
+  var question = companionLabel + ' jetzt automatisch von GitHub herunterladen und installieren?';
+  if (warning) {{
+    question = '⚠️ Achtung\\n\\n' + warning + '\\n\\n' + companionLabel + ' trotzdem von GitHub herunterladen und installieren?';
+  }}
+  if (!confirm(question)) {{
     return false;
   }}
   var modal = document.getElementById('companion-install-modal');
@@ -919,6 +923,9 @@ setTimeout(function() {
 #     "install_script_path" (Default "setup/install.sh"), "beschreibung" -
 #     Partner-App, die sich per Button dieser App aus nachinstallieren laesst
 #     (siehe render_landing()/_run_companion_install_in_background()).
+#     Zusaetzlich optional im "companion"-Objekt "warnung_ohne_pi": Text, der
+#     auf Systemen OHNE Raspberry Pi vor dem Installieren per confirm()
+#     angezeigt wird (nur Warnung, keine Sperre).
 #   "beschreibung": kurzer Text, was die App macht - erscheint auf /hilfe
 #     (siehe render_app_beschreibungen()).
 #   "busy_check": {"json_file", "key"} - JSON-Datei der App mit einem Bool-Feld;
@@ -2882,13 +2889,17 @@ def render_landing(request_host=None):
             f'<p class="muted" style="font-size:.85rem; margin:.4rem 0 0;">{html.escape(comp["beschreibung"])}</p>'
             if comp.get("beschreibung") else ""
         )
+        # Nur auf Nicht-Pi-Systemen warnen; als JS-String-Literal im onclick-
+        # Attribut (json.dumps + html.escape), sonst 'null' = keine Warnung.
+        warnung = comp.get("warnung_ohne_pi") if not IS_PI else None
+        warnung_js = html.escape(json.dumps(warnung), quote=True) if warnung else "null"
         companion_parts.append(
             '<div class="msg" style="text-align:center;">'
             f'<p>{comp.get("emoji", "⬇️")} <strong>{html.escape(comp["label"])}</strong> '
             'ist auf diesem Pi noch nicht installiert.</p>'
             f'{beschreibung_block}'
             f'<button class="btn btn-small" style="margin-top:.6rem;" onclick="return startCompanionInstall(\'{app["id"]}\', '
-            f'\'{comp["app_id"]}\', \'{comp["label"]}\')">⚙️ {html.escape(comp["label"])} installieren</button>'
+            f'\'{comp["app_id"]}\', \'{comp["label"]}\', {warnung_js})">⚙️ {html.escape(comp["label"])} installieren</button>'
             '</div>'
         )
     companion_section = "".join(companion_parts)
