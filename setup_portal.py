@@ -89,12 +89,19 @@ kein Foto-Handling, nichts), es kennt nur das generische Schema.
   geaendert, startet nach dem normalen Update zusaetzlich automatisch ein
   Komplett-Lauf (abschaltbar, Standard an) - als eigene systemd-run-Einheit
   (CLI --auto-install-sh), siehe _start_auto_install_sh() fuer den Grund.
+- Update-Sperre (RUN_DIR/update.lock, flock): Updates, Versionswechsel,
+  install.sh-Laeufe, Restore und das Selbst-Update laufen nie gleichzeitig -
+  auch nicht prozessuebergreifend (Webserver vs. Timer-Laeufe). Die Timer-
+  Laeufe warten, Web-Aktionen melden sofort, was gerade laeuft. Die
+  systemneustart.py der Apps pruefen dieselbe Datei. Siehe
+  try_acquire_update_lock().
 - Nutzungszaehler: --check-update laedt einmal pro Tag ein kleines Asset
   aus dem Release STATS_RELEASE_TAG des App-Repos; GitHub zaehlt die
   Downloads (download_count). Es wird nichts mitgesendet.
 
 Nur Python-Standardbibliothek.
 """
+import fcntl
 import hashlib
 import html
 import io
@@ -116,7 +123,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote
 
-PORTAL_VERSION = "1.8.14"
+PORTAL_VERSION = "1.8.15"
 
 PORTAL_DIR = "/opt/setup-portal"
 # Jede App legt hier per eigenem install.sh genau eine Datei <app-id>.json
@@ -131,6 +138,13 @@ STATE_DIR = f"{PORTAL_DIR}/state"
 # VPN-Screenshots. "_shared" ist ein reservierter Pseudo-App-Ordner fuer die
 # (app-unabhaengige) Fritzbox/WireGuard-Anleitung, siehe _vpn_image_app_id().
 HILFE_IMAGES_DIR = f"{PORTAL_DIR}/hilfe-bilder"
+# Fluechtige Laufzeitdaten (tmpfs, nach einem Reboot leer): die gemeinsame
+# Update-Sperre (siehe try_acquire_update_lock()) und der Status laufender
+# Web-Vorgaenge (siehe _set_update_state()). Der Pfad der Sperrdatei ist
+# Schnittstelle: die systemneustart.py der Apps fragen ihn ebenfalls ab.
+RUN_DIR = "/run/setup-portal"
+UPDATE_LOCK_PATH = f"{RUN_DIR}/update.lock"
+WEB_UPDATE_STATUS_PATH = f"{RUN_DIR}/update_status.json"
 
 HOST = "0.0.0.0"
 PORT_LANDING = int(os.environ.get("SETUP_PORTAL_LANDING_PORT", "80"))
@@ -172,6 +186,145 @@ def _known_companion_ids():
 
 def _update_state(app_id):
     return UPDATE_STATE.setdefault(app_id, {"done": True, "ok": None, "detail": None})
+
+
+# Nur der Webserver-Prozess (main()) spiegelt UPDATE_STATE in eine Datei -
+# die CLI-Aufrufe (--check-update usw.) wuerden sie sonst mit ihrem eigenen,
+# leeren UPDATE_STATE ueberschreiben.
+_PERSIST_UPDATE_STATE = False
+_UPDATE_STATE_LOCK = threading.Lock()
+
+INTERRUPTED_DETAIL = ("Vorgang wurde unterbrochen, weil das Setup-Portal neu gestartet wurde. "
+                      "Bitte den Versionsstand prüfen und den Vorgang ggf. erneut ausführen.")
+
+
+def _set_update_state(app_id, **fields):
+    """Aendert den Status eines Web-Vorgangs (App-ID oder "_all") und schreibt
+    ihn nach WEB_UPDATE_STATUS_PATH - damit ein Neustart des Portals mitten
+    im Vorgang nicht wie frueher als leere Fehlermeldung ("❌ null") endet,
+    sondern beim naechsten Start als "unterbrochen" erkannt wird (siehe
+    _load_update_state_at_start())."""
+    with _UPDATE_STATE_LOCK:
+        _update_state(app_id).update(fields)
+        if not _PERSIST_UPDATE_STATE:
+            return
+        try:
+            os.makedirs(RUN_DIR, exist_ok=True)
+            tmp = WEB_UPDATE_STATUS_PATH + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(UPDATE_STATE, f)
+            os.replace(tmp, WEB_UPDATE_STATUS_PATH)
+        except OSError:
+            pass  # Anzeige funktioniert dann wie frueher nur aus dem Speicher
+
+
+def _load_update_state_at_start():
+    """Beim Start des Webservers: gespeicherte Vorgaenge uebernehmen. Was noch
+    als laufend (done=False) dasteht, kann nicht mehr laufen - der Prozess,
+    der es ausgefuehrt hat, ist ja gerade beendet worden."""
+    global _PERSIST_UPDATE_STATE
+    _PERSIST_UPDATE_STATE = True
+    try:
+        with open(WEB_UPDATE_STATUS_PATH) as f:
+            saved = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return
+    if not isinstance(saved, dict):
+        return
+    for key, state in saved.items():
+        if not isinstance(state, dict):
+            continue
+        if state.get("done") is False:
+            state = {"done": True, "ok": False, "detail": INTERRUPTED_DETAIL}
+            print(f"Vorgang '{key}' wurde durch einen Neustart unterbrochen.", file=sys.stderr)
+        _set_update_state(key, **state)
+
+
+def try_acquire_update_lock(what):
+    """Gemeinsame Sperre fuer alles, was App-Dateien/-Dienste umbaut (Update,
+    Versionswechsel, install.sh-Lauf, Restore) oder das Portal neu startet
+    (Selbst-Update) - ueber ALLE Prozesse hinweg (Webserver, naechtliche
+    --check-update-/--auto-install-sh-/--self-update-Laeufe). Anlass
+    (2026-10-10): direkt nach dem Booten holten die Timer verpasste Laeufe
+    nach, das Selbst-Update startete das Portal mitten in "Alle
+    aktualisieren" neu und brach das BeeTown-Update ab. flock() statt
+    PID-Datei: der Kernel gibt die Sperre frei, sobald der Prozess endet,
+    auch bei einem Absturz. Gibt das offene Datei-Objekt zurueck (Freigabe =
+    close()) oder None, wenn die Sperre schon vergeben ist."""
+    try:
+        os.makedirs(RUN_DIR, exist_ok=True)
+        f = open(UPDATE_LOCK_PATH, "a+")
+    except OSError:
+        return None
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        f.close()
+        return None
+    f.seek(0)
+    f.truncate()
+    json.dump({"pid": os.getpid(), "what": what, "since": time.strftime("%H:%M")}, f)
+    f.flush()
+    return f
+
+
+def acquire_update_lock_waiting(what, max_wait_s):
+    """Wie try_acquire_update_lock(), wartet aber bis zu max_wait_s Sekunden -
+    fuer die Hintergrund-Laeufe per Timer, die es nicht eilig haben."""
+    deadline = time.time() + max_wait_s
+    announced = False
+    while True:
+        lock = try_acquire_update_lock(what)
+        if lock:
+            return lock
+        if time.time() >= deadline:
+            return None
+        if not announced:
+            print(f"Warte, bis dieser Vorgang fertig ist: {update_lock_holder() or 'unbekannt'}", file=sys.stderr)
+            announced = True
+        time.sleep(5)
+
+
+def update_lock_holder():
+    """None, wenn die Sperre frei ist, sonst ein Text wie
+    "Update BeeTown HonigBox (seit 14:36)"."""
+    try:
+        f = open(UPDATE_LOCK_PATH)
+    except OSError:
+        return None
+    with f:
+        try:
+            fcntl.flock(f, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except OSError:
+            try:
+                info = json.loads(f.read() or "{}")
+            except json.JSONDecodeError:
+                info = {}
+            what = info.get("what") or "ein anderer Vorgang"
+            return f"{what} (seit {info['since']})" if info.get("since") else what
+        return None
+
+
+def busy_message():
+    return (f"Gerade läuft bereits: {update_lock_holder() or 'ein anderer Vorgang'}. "
+            "Bitte warten, bis das fertig ist, und dann erneut versuchen.")
+
+
+def _start_locked_job(lock, what, state_getter, target, *args):
+    """Startet einen Web-Vorgang als Thread, der die bereits geholte Sperre am
+    Ende in jedem Fall wieder freigibt, und schreibt Start/Ende ins Journal
+    (bis 2026-10-10 war im Nachhinein nicht nachvollziehbar, was wann lief)."""
+    def runner():
+        print(f"Gestartet: {what}", file=sys.stderr)
+        try:
+            target(*args)
+        finally:
+            lock.close()
+            state = state_getter()
+            result = "ok" if state.get("ok") else "FEHLER"
+            detail = str(state.get("detail")).replace("\n", " / ")
+            print(f"Beendet: {what} - {result}: {detail}", file=sys.stderr)
+    threading.Thread(target=runner, daemon=True).start()
 
 
 def _detect_is_pi():
@@ -348,11 +501,12 @@ function startCompanionInstall(hostAppId, companionAppId, companionLabel, warnin
   modal.classList.add('show');
   fetch('/companion/install/' + hostAppId, {{method: 'POST'}}).then(r => r.json()).then(function(d) {{
     if (!d.started) {{
-      content.innerHTML = '<div class="msg err">❌ ' + (d.error || 'Konnte nicht gestartet werden.') + '</div>';
+      content.innerHTML = '<div class="msg err">❌ ' + (d.error || 'Konnte nicht gestartet werden.') + '</div>' +
+        '<button type="button" onclick="window.location.reload()">OK</button>';
       return;
     }}
     companionInstallPoll(companionAppId, content);
-  }});
+  }}).catch(function() {{ companionInstallPoll(companionAppId, content); }});
   return false;
 }}
 </script>
@@ -766,27 +920,74 @@ PAGE_UPDATE = """<!doctype html>
   <div class="modal-box" id="update-modal-content"></div>
 </div>
 <script>
-function updatePoll(appId, content, modal) {{
-  fetch('/update/status/' + appId).then(r => r.json()).then(function(d) {{
-    if (!d.done) {{ setTimeout(function() {{ updatePoll(appId, content, modal); }}, 2000); return; }}
-    content.innerHTML = d.ok
-      ? '<div class="msg ok">✅ ' + d.detail + '</div>'
-      : '<div class="msg err">❌ ' + d.detail + '</div>';
-    setTimeout(function() {{ window.location.reload(); }}, 2500);
-  }}).catch(function() {{ setTimeout(function() {{ updatePoll(appId, content, modal); }}, 2000); }});
+var SPINNER = '""" + SPINNER_SVG + """';
+function openUpdateModal(title, hint) {{
+  var content = document.getElementById('update-modal-content');
+  content.innerHTML = '<h1>' + SPINNER + title + '</h1>' +
+    '<p class="update-progress" style="font-weight:600; min-height:1.4em;"></p>' +
+    '<p class="muted">' + hint + '</p>';
+  document.getElementById('update-modal').classList.add('show');
+  return content;
+}}
+// Nach einem Selbst-Update startet das Portal neu - dann nicht auf einer
+// Fehlerseite landen, sondern warten, bis es wieder antwortet.
+function reloadWhenReachable() {{
+  fetch('/update', {{cache: 'no-store'}}).then(function(r) {{
+    if (r.ok) {{ window.location.reload(); }} else {{ setTimeout(reloadWhenReachable, 3000); }}
+  }}).catch(function() {{ setTimeout(reloadWhenReachable, 3000); }});
+}}
+// ok: true/false/null (null = kein Ergebnis bekannt). Text per textContent,
+// Fehlermeldungen koennen Ausgaben von install.sh enthalten. Erfolg laedt
+// automatisch neu, alles andere bleibt zum Lesen stehen.
+function showResult(content, ok, text) {{
+  var box = document.createElement('div');
+  box.className = ok === true ? 'msg ok' : (ok === false ? 'msg err' : 'msg');
+  box.style.whiteSpace = 'pre-line';
+  if (text.indexOf('\\n') >= 0) box.style.textAlign = 'left';
+  box.textContent = (ok === true ? '✅ ' : (ok === false ? '❌ ' : 'ℹ️ ')) + text;
+  content.innerHTML = '';
+  content.appendChild(box);
+  if (ok === true) {{ setTimeout(reloadWhenReachable, 2500); return; }}
+  var btn = document.createElement('button');
+  btn.type = 'button';
+  btn.textContent = 'OK';
+  btn.onclick = reloadWhenReachable;
+  content.appendChild(btn);
+}}
+function updatePoll(appId, content) {{
+  fetch('/update/status/' + appId, {{cache: 'no-store'}}).then(r => r.json()).then(function(d) {{
+    if (!d.done) {{
+      var p = content.querySelector('.update-progress');
+      if (p && d.progress) p.textContent = d.progress;
+      setTimeout(function() {{ updatePoll(appId, content); }}, 2000);
+      return;
+    }}
+    if (d.ok === true || d.ok === false) {{
+      showResult(content, d.ok, d.detail || (d.ok ? 'Fertig.' : 'Fehlgeschlagen (keine Details).'));
+    }} else {{
+      showResult(content, null, 'Zu diesem Vorgang liegt kein Ergebnis vor. Bitte den Stand auf der Seite prüfen.');
+    }}
+  }}).catch(function() {{ setTimeout(function() {{ updatePoll(appId, content); }}, 2000); }});
+}}
+// Erst die Antwort auf den Start abwarten, dann pollen - frueher lief beides
+// gleichzeitig, und eine zu fruehe Statusabfrage meldete "fertig" ohne
+// Ergebnis (das leere ❌).
+function startJob(url, body, appId, content) {{
+  var init = {{method: 'POST'}};
+  if (body) init.body = body;
+  fetch(url, init).then(r => r.json()).then(function(d) {{
+    if (!d.started) {{ showResult(content, false, d.error || 'Konnte nicht gestartet werden.'); return; }}
+    updatePoll(appId, content);
+  }}).catch(function() {{ updatePoll(appId, content); }});
 }}
 function startUpdate(appId, tag) {{
   if (!confirm('Auf Version ' + tag + ' aktualisieren? Vorher wird automatisch ein Backup erstellt.')) {{
     return false;
   }}
-  var modal = document.getElementById('update-modal');
-  var content = document.getElementById('update-modal-content');
-  content.innerHTML = '<h1>""" + SPINNER_SVG + """Aktualisiere…</h1>' +
-    '<p class="muted">Backup wird erstellt, neue Version heruntergeladen und installiert. ' +
-    'Das kann einige Minuten dauern – bitte die Seite nicht schließen.</p>';
-  modal.classList.add('show');
-  fetch('/update/run/' + appId, {{method: 'POST'}});
-  updatePoll(appId, content, modal);
+  var content = openUpdateModal('Aktualisiere…',
+    'Backup wird erstellt, neue Version heruntergeladen und installiert. ' +
+    'Das kann einige Minuten dauern – bitte die Seite nicht schließen.');
+  startJob('/update/run/' + appId, null, appId, content);
   return false;
 }}
 function startVersionSwitch(form, appId) {{
@@ -795,27 +996,20 @@ function startVersionSwitch(form, appId) {{
   if (!confirm('Wirklich auf Version ' + tag + ' wechseln? Vorher wird automatisch ein Backup erstellt.')) {{
     return false;
   }}
-  var modal = document.getElementById('update-modal');
-  var content = document.getElementById('update-modal-content');
-  content.innerHTML = '<h1>""" + SPINNER_SVG + """Wechsle Version…</h1>' +
-    '<p class="muted">Backup wird erstellt, gewählte Version heruntergeladen und installiert. ' +
-    'Das kann einige Minuten dauern – bitte die Seite nicht schließen.</p>';
-  modal.classList.add('show');
-  fetch('/update/switch/' + appId, {{method: 'POST', body: new URLSearchParams(new FormData(form))}});
-  updatePoll(appId, content, modal);
+  var content = openUpdateModal('Wechsle Version…',
+    'Backup wird erstellt, gewählte Version heruntergeladen und installiert. ' +
+    'Das kann einige Minuten dauern – bitte die Seite nicht schließen.');
+  startJob('/update/switch/' + appId, new URLSearchParams(new FormData(form)), appId, content);
   return false;
 }}
 function startUpdateAll() {{
-  if (!confirm('Wirklich alle Apps aktualisieren? Vorher wird pro App automatisch ein Backup erstellt.')) {{
+  if (!confirm('Alle Apps mit neuer Version aktualisieren? Vorher wird pro App automatisch ein Backup erstellt.')) {{
     return false;
   }}
-  var modal = document.getElementById('update-modal');
-  var content = document.getElementById('update-modal-content');
-  content.innerHTML = '<h1>""" + SPINNER_SVG + """Aktualisiere alle Apps…</h1>' +
-    '<p class="muted">Das kann je nach Anzahl der Apps einige Minuten dauern – bitte die Seite nicht schließen.</p>';
-  modal.classList.add('show');
-  fetch('/update/run-all', {{method: 'POST'}});
-  updatePoll('_all', content, modal);
+  var content = openUpdateModal('Aktualisiere alle Apps…',
+    'Die Apps werden nacheinander aktualisiert, bereits aktuelle übersprungen. ' +
+    'Das kann einige Minuten dauern – bitte die Seite nicht schließen.');
+  startJob('/update/run-all', null, '_all', content);
   return false;
 }}
 function startInstallRun(appId) {{
@@ -823,19 +1017,10 @@ function startInstallRun(appId) {{
                'Update, das auch install.sh selbst betrifft (z. B. neue Setup-Funktionen).')) {{
     return false;
   }}
-  var modal = document.getElementById('update-modal');
-  var content = document.getElementById('update-modal-content');
-  content.innerHTML = '<h1>""" + SPINNER_SVG + """install.sh wird ausgeführt…</h1>' +
-    '<p class="muted">Lädt die neueste Version von GitHub und führt deren install.sh aus. ' +
-    'Das kann einige Minuten dauern – bitte die Seite nicht schließen.</p>';
-  modal.classList.add('show');
-  fetch('/update/run-install/' + appId, {{method: 'POST'}}).then(r => r.json()).then(function(d) {{
-    if (!d.started) {{
-      content.innerHTML = '<div class="msg err">❌ ' + (d.error || 'Konnte nicht gestartet werden.') + '</div>';
-      return;
-    }}
-    updatePoll(appId, content, modal);
-  }});
+  var content = openUpdateModal('install.sh wird ausgeführt…',
+    'Lädt die neueste Version von GitHub und führt deren install.sh aus. ' +
+    'Das kann einige Minuten dauern – bitte die Seite nicht schließen.');
+  startJob('/update/run-install/' + appId, null, appId, content);
   return false;
 }}
 function updateVersionSwitchButton(select, appId) {{
@@ -848,32 +1033,22 @@ function updateVersionSwitchButton(select, appId) {{
 document.querySelectorAll('select[data-app-id]').forEach(function(sel) {{
   updateVersionSwitchButton(sel, sel.dataset.appId);
 }});
-function selfUpdatePoll(content, modal) {{
-  fetch('/update/self-update-check/status').then(r => r.json()).then(function(d) {{
-    if (!d.done) {{ setTimeout(function() {{ selfUpdatePoll(content, modal); }}, 2000); return; }}
-    content.innerHTML = d.ok
-      ? '<div class="msg ok">✅ ' + d.detail + '</div>'
-      : '<div class="msg err">❌ ' + (d.detail || 'Fehler.') + '</div>';
-    setTimeout(function() {{ window.location.reload(); }}, 2500);
-  }}).catch(function() {{ setTimeout(function() {{ selfUpdatePoll(content, modal); }}, 2000); }});
+function selfUpdatePoll(content) {{
+  fetch('/update/self-update-check/status', {{cache: 'no-store'}}).then(r => r.json()).then(function(d) {{
+    if (!d.done) {{ setTimeout(function() {{ selfUpdatePoll(content); }}, 2000); return; }}
+    showResult(content, d.ok === true, d.detail || (d.ok ? 'Fertig.' : 'Fehler.'));
+  }}).catch(function() {{ setTimeout(function() {{ selfUpdatePoll(content); }}, 2000); }});
 }}
 function startSelfUpdateCheck() {{
   if (!confirm('Jetzt auf eine neue Portal-Version prüfen? Falls eine gefunden wird, startet der Dienst kurz neu - diese Seite ist dann kurz nicht erreichbar.')) {{
     return false;
   }}
-  var modal = document.getElementById('update-modal');
-  var content = document.getElementById('update-modal-content');
-  content.innerHTML = '<h1>""" + SPINNER_SVG + """Prüfe auf neue Version…</h1>' +
-    '<p class="muted">Das kann bis zu einer Minute dauern.</p>';
-  modal.classList.add('show');
+  var content = openUpdateModal('Prüfe auf neue Version…', 'Das kann bis zu einer Minute dauern.');
   fetch('/update/self-update-check', {{method: 'POST'}}).then(r => r.json()).then(function(d) {{
-    if (!d.started) {{
-      content.innerHTML = '<div class="msg err">❌ ' + (d.error || 'Konnte nicht gestartet werden.') + '</div>';
-      return;
-    }}
-    selfUpdatePoll(content, modal);
+    if (!d.started) {{ showResult(content, false, d.error || 'Konnte nicht gestartet werden.'); return; }}
+    selfUpdatePoll(content);
   }}).catch(function() {{
-    selfUpdatePoll(content, modal);
+    selfUpdatePoll(content);
   }});
   return false;
 }}
@@ -2137,6 +2312,13 @@ def _fetch_raw_file(repo, tag, path, timeout=15):
 
 SELF_UPDATE_GITHUB_REPO = "Chrischn73/setup-portal"
 SELF_UPDATE_FILES = ("setup_portal.py", "setup-portal.sh", "regen-issue.sh")
+# Wartezeiten auf die Update-Sperre fuer die Laeufe per Timer (Oneshot-Units
+# ohne Start-Timeout). Laeuft der andere Vorgang laenger, wird der Lauf
+# ausgelassen und in der naechsten Nacht nachgeholt.
+SELF_UPDATE_MAX_WAIT_S = 30 * 60
+AUTO_UPDATE_MAX_WAIT_S = 15 * 60
+# install.sh darf bis zu 30 Minuten laufen (siehe _download_and_run_install_script()).
+AUTO_INSTALL_SH_MAX_WAIT_S = 40 * 60
 # Ergebnis des letzten Selbst-Update-Checks (egal ob vom taeglichen Timer
 # oder manuell per "Jetzt prüfen"-Button ausgeloest) - EINE gemeinsame
 # Datei, kein App-Bezug. Schreibender Prozess ist immer die --self-update-
@@ -2186,7 +2368,21 @@ def _self_update():
         print(f"Bereits aktuell (neueste Version: {release['tag']}).", file=sys.stderr)
         _write_self_update_state(True, True, f"Du hast bereits die neueste Version ({release['tag']}).")
         return
-    print(f"Neuere Version gefunden: {release['tag']} - lade herunter...", file=sys.stderr)
+    print(f"Neuere Version gefunden: {release['tag']}", file=sys.stderr)
+    # Der Neustart am Ende beendet jeden Vorgang im Webserver-Prozess (z. B.
+    # "Alle aktualisieren") - deshalb erst warten, bis keiner mehr laeuft,
+    # und die Sperre bis zum Prozessende halten, damit bis zum Neustart auch
+    # keiner neu startet. Nicht nur theoretisch: nach dem Booten holen die
+    # Timer verpasste Laeufe nach, genau dann wird oft auch von Hand
+    # aktualisiert (Vorfall 2026-10-10).
+    lock = acquire_update_lock_waiting("Selbst-Update des Setup-Portals", SELF_UPDATE_MAX_WAIT_S)
+    if not lock:
+        print("Es laeuft noch ein anderer Vorgang - Selbst-Update wird beim naechsten Check nachgeholt.",
+              file=sys.stderr)
+        _write_self_update_state(True, False, "Es lief noch ein anderer Vorgang - das Portal-Update "
+                                 "wird beim nächsten Check nachgeholt.")
+        return
+    print(f"Lade {release['tag']} herunter...", file=sys.stderr)
     try:
         req = urllib.request.Request(release["tarball_url"], headers={"User-Agent": "Setup-Portal-Self-Update"})
         with urllib.request.urlopen(req, timeout=60) as resp:
@@ -2255,6 +2451,10 @@ def trigger_self_update_check():
     NICHT aus der Antwort dieser Funktion. Gibt (True, None) oder
     (False, Fehlertext) zurueck - Fehler hier bedeuten "Start selbst hat
     nicht geklappt", nicht "keine neue Version gefunden"."""
+    # Von Hand gibt es kein stilles Warten wie beim Timer (siehe _self_update()):
+    # lieber sofort sagen, was gerade laeuft.
+    if update_lock_holder():
+        return False, busy_message()
     _write_self_update_state(False)  # "laeuft" - erst der --self-update-Prozess selbst setzt done=True
     try:
         result = subprocess.run(
@@ -2368,23 +2568,41 @@ def run_update_check_once(app, allow_auto=True):
     if update_available and get_auto_update(app_id) and release.get("tarball_url"):
         due_at, _urgent = auto_update_due(app, current, fetch_all_releases(app) or [release])
         if allow_auto and (due_at is None or time.time() >= due_at):
-            ok, detail = perform_update(app, release["tarball_url"], release["tag"])
-            _update_state(app_id).update(done=True, ok=ok, detail=detail)
-            if ok:
-                current = app_version(app)
-                update_available = False
-                auto_updated_version = current
-                if get_auto_install_sh(app_id) and install_sh_changed(app, release["tag"]):
-                    _start_auto_install_sh(app)
+            lock = acquire_update_lock_waiting(f"automatisches Update {app['label']}", AUTO_UPDATE_MAX_WAIT_S)
+            if not lock:
+                print(f"Anderer Vorgang laeuft zu lange - automatisches Update von {app['label']} "
+                      "wird beim naechsten Check nachgeholt.", file=sys.stderr)
+            else:
+                with lock:
+                    # Waehrend des Wartens kann die App schon von Hand
+                    # aktualisiert worden sein.
+                    current = app_version(app)
+                    update_available = parse_version(release["tag"]) > parse_version(current)
+                    if update_available:
+                        print(f"Automatisches Update {app['label']} {current} -> {release['tag']}...",
+                              file=sys.stderr)
+                        ok, detail = perform_update(app, release["tarball_url"], release["tag"])
+                        print(detail, file=sys.stderr)
+                        if ok:
+                            current = app_version(app)
+                            update_available = False
+                            auto_updated_version = current
+                            if get_auto_install_sh(app_id) and install_sh_changed(app, release["tag"]):
+                                _start_auto_install_sh(app)
         else:
             auto_update_due_at = due_at
     elif (allow_auto and not update_available and release
           and get_auto_install_sh(app_id) and not app_is_busy(app)
-          and install_sh_out_of_sync(app)):
+          and not update_lock_holder() and install_sh_out_of_sync(app)):
         # Version aktuell, aber install.sh lief seit dem Update nie (z. B. nach
         # einem manuellen "normalen" Update): Komplett-Lauf nachholen. Scheitert
         # er, schaltet _record_auto_install_result() die Automatik ab - keine
         # naechtliche Schleife; gelingt er, wird der Hash geschrieben.
+        # Nicht bei belegter Sperre: install.sh startet am Ende selbst diesen
+        # Check, waehrend es noch laeuft und den neuen Hash noch nicht
+        # geschrieben hat - ohne diese Bedingung startete das einen zweiten
+        # Komplett-Lauf, der beim Auto-Lauf am gleichnamigen systemd-run-Unit
+        # scheiterte und damit die Automatik abschaltete.
         _start_auto_install_sh(app)
     state.update({
         "current": current,
@@ -2430,6 +2648,25 @@ def _record_auto_install_result(app, ok, detail):
 
 def run_auto_install_sh(app):
     """CLI --auto-install-sh, gestartet von _start_auto_install_sh()."""
+    lock = acquire_update_lock_waiting(f"Komplett-Lauf (install.sh) {app['label']}", AUTO_INSTALL_SH_MAX_WAIT_S)
+    if not lock:
+        print("Anderer Vorgang laeuft zu lange - Komplett-Lauf wird beim naechsten Check nachgeholt.",
+              file=sys.stderr)
+        return
+    with lock:
+        # install.sh startet am Ende selbst <app>-update-check.service, das
+        # (Hash noch alt) diesen Lauf ein zweites Mal anstoesst - der wartet
+        # dann hier und hat danach nichts mehr zu tun. Ohne gespeicherten
+        # Hash (Altinstallation) wird bewusst trotzdem einmal komplett
+        # installiert, siehe install_sh_changed().
+        if _read_installed_install_sh_hash(app["id"]) and not install_sh_out_of_sync(app):
+            print(f"{app['label']}: install.sh ist bereits auf dem Stand der installierten Version.",
+                  file=sys.stderr)
+            return
+        _run_auto_install_sh_locked(app)
+
+
+def _run_auto_install_sh_locked(app):
     try:
         ok, detail, install_sh_hash = _download_and_run_install_script(
             app["update"]["github_repo"], app.get("install_script_path", "setup/install.sh"), app["label"])
@@ -2443,17 +2680,26 @@ def run_auto_install_sh(app):
     print(detail, file=sys.stderr)
 
 
-def perform_update(app, tarball_url, target_tag):
+def perform_update(app, tarball_url, target_tag, progress=None):
     """Legt zuerst ein Backup an, laedt dann den Source-Tarball des GitHub-
     Release herunter und kopiert die in app['update']['file_map']
     beschriebenen Dateien/Ordner an ihren Zielort. Aktualisiert bewusst NICHT
     dieses Setup-Portal selbst (das war frueher in beiden Vorlagen-Projekten
     der Fall, siehe SETUP_PORTAL_FILE_MAP dort - hier entfaellt das: das
     Portal wird unabhaengig ueber install.sh der jeweiligen App versioniert).
+    Die Update-Sperre (try_acquire_update_lock()) muss der Aufrufer halten.
+    progress: optionale Funktion, bekommt den aktuellen Schritt als Text
+    (Anzeige im "Aktualisiere..."-Dialog).
     Gibt (True, Meldung) oder (False, Fehlertext) zurueck."""
+    def _step(text):
+        if progress:
+            progress(text)
+
+    _step("Backup wird erstellt…")
     ok, detail = create_backup_now(app)
     if not ok:
         return False, f"Backup vor dem Update fehlgeschlagen - Update abgebrochen: {detail}"
+    _step(f"Version {target_tag} wird heruntergeladen…")
     try:
         req = urllib.request.Request(tarball_url, headers={"User-Agent": "Pi-Setup-Update"})
         with urllib.request.urlopen(req, timeout=60) as resp:
@@ -2464,9 +2710,11 @@ def perform_update(app, tarball_url, target_tag):
     services = app["update"].get("services_to_restart", [])
 
     def _restart_services():
+        _step("Dienste werden wieder gestartet…")
         for svc in services:
             subprocess.run(["systemctl", "start", svc], capture_output=True, text=True)
 
+    _step("Dateien werden installiert…")
     for svc in services:
         subprocess.run(["systemctl", "stop", svc], capture_output=True, text=True)
 
@@ -2517,15 +2765,17 @@ def _run_update_in_background(app):
     # "Aktualisiere..."-Overlay wuerde dann fuer immer weiterpollen.
     app_id = app["id"]
     try:
+        _set_update_state(app_id, progress="Neueste Version wird ermittelt…")
         release = fetch_latest_release(app)
         if not release or not release.get("tarball_url"):
-            _update_state(app_id).update(done=True, ok=False, detail="Neueste Version konnte nicht ermittelt werden.")
+            _set_update_state(app_id, done=True, ok=False, detail="Neueste Version konnte nicht ermittelt werden.")
             return
-        ok, detail = perform_update(app, release["tarball_url"], release["tag"])
-        _update_state(app_id).update(done=True, ok=ok, detail=detail)
+        ok, detail = perform_update(app, release["tarball_url"], release["tag"],
+                                    progress=lambda text: _set_update_state(app_id, progress=text))
         run_update_check_once(app, allow_auto=False)
+        _set_update_state(app_id, done=True, ok=ok, detail=detail)
     except Exception as e:
-        _update_state(app_id).update(done=True, ok=False, detail=f"Unerwarteter Fehler: {e}")
+        _set_update_state(app_id, done=True, ok=False, detail=f"Unerwarteter Fehler: {e}")
 
 
 def _run_version_switch_in_background(app, tag):
@@ -2537,37 +2787,49 @@ def _run_version_switch_in_background(app, tag):
         previous_version = app_version(app)
         release = fetch_release_by_tag(app, tag)
         if not release or not release.get("tarball_url"):
-            _update_state(app_id).update(done=True, ok=False, detail=f"Version '{tag}' konnte nicht gefunden werden.")
+            _set_update_state(app_id, done=True, ok=False, detail=f"Version '{tag}' konnte nicht gefunden werden.")
             return
-        ok, detail = perform_update(app, release["tarball_url"], release["tag"])
+        ok, detail = perform_update(app, release["tarball_url"], release["tag"],
+                                    progress=lambda text: _set_update_state(app_id, progress=text))
         if ok and parse_version(release["tag"]) < parse_version(previous_version):
             set_auto_update(app_id, False)
             detail += (" Automatische Updates wurden dabei ausgeschaltet, damit der Pi nicht "
                        "gleich wieder auf die neuere Version zurueckaktualisiert.")
-        _update_state(app_id).update(done=True, ok=ok, detail=detail)
         run_update_check_once(app, allow_auto=False)
+        _set_update_state(app_id, done=True, ok=ok, detail=detail)
     except Exception as e:
-        _update_state(app_id).update(done=True, ok=False, detail=f"Unerwarteter Fehler: {e}")
+        _set_update_state(app_id, done=True, ok=False, detail=f"Unerwarteter Fehler: {e}")
 
 
 def _run_update_all_in_background():
+    """Aktualisiert nacheinander jede App, fuer die eine neuere Version
+    vorliegt - bereits aktuelle werden uebersprungen (frueher wurden auch sie
+    neu installiert, mit Backup und Dienst-Neustart, ohne Nutzen)."""
     try:
         apps = load_apps()
         results = []
         overall_ok = True
-        for app in apps:
+        for nr, app in enumerate(apps, 1):
+            prefix = f"{app['label']} ({nr}/{len(apps)})"
+            _set_update_state("_all", progress=f"{prefix}: Neueste Version wird ermittelt…")
             release = fetch_latest_release(app)
             if not release or not release.get("tarball_url"):
                 overall_ok = False
-                results.append(f"{app['label']}: neueste Version konnte nicht ermittelt werden.")
+                results.append(f"❌ {app['label']}: neueste Version konnte nicht ermittelt werden.")
                 continue
-            ok, detail = perform_update(app, release["tarball_url"], release["tag"])
+            current = app_version(app)
+            if parse_version(release["tag"]) <= parse_version(current):
+                results.append(f"✅ {app['label']}: bereits aktuell ({current}).")
+                continue
+            ok, detail = perform_update(app, release["tarball_url"], release["tag"],
+                                        progress=lambda text, p=prefix: _set_update_state("_all", progress=f"{p}: {text}"))
             run_update_check_once(app, allow_auto=False)
             overall_ok = overall_ok and ok
-            results.append(f"{app['label']}: {detail}")
-        UPDATE_STATE["_all"] = {"done": True, "ok": overall_ok, "detail": " / ".join(results) or "Keine Anwendung registriert."}
+            results.append(f"{'✅' if ok else '❌'} {app['label']}: {detail}")
+        _set_update_state("_all", done=True, ok=overall_ok,
+                          detail=("Ergebnis:\n" + "\n".join(results)) if results else "Keine Anwendung registriert.")
     except Exception as e:
-        UPDATE_STATE["_all"] = {"done": True, "ok": False, "detail": f"Unerwarteter Fehler: {e}"}
+        _set_update_state("_all", done=True, ok=False, detail=f"Unerwarteter Fehler: {e}")
 
 
 def _download_and_run_install_script(github_repo, install_script_path, label):
@@ -2654,11 +2916,11 @@ def _run_install_script_in_background(app):
             app["update"]["github_repo"], app.get("install_script_path", "setup/install.sh"), app["label"])
         if ok and install_sh_hash:
             _write_installed_install_sh_hash(app_id, install_sh_hash)
-        _update_state(app_id).update(done=True, ok=ok, detail=detail)
+        _set_update_state(app_id, done=True, ok=ok, detail=detail)
     except subprocess.TimeoutExpired:
-        _update_state(app_id).update(done=True, ok=False, detail="Ausführung hat zu lange gedauert (Timeout).")
+        _set_update_state(app_id, done=True, ok=False, detail="Ausführung hat zu lange gedauert (Timeout).")
     except Exception as e:
-        _update_state(app_id).update(done=True, ok=False, detail=f"Unerwarteter Fehler: {e}")
+        _set_update_state(app_id, done=True, ok=False, detail=f"Unerwarteter Fehler: {e}")
 
 
 def render_update_card(app, message=""):
@@ -2978,6 +3240,34 @@ class BaseHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _start_update_job(self, state_key, what, target, *args):
+        """Gemeinsamer Start fuer Update/Versionswechsel/install.sh-Lauf/"Alle
+        aktualisieren": nur mit freier Update-Sperre - die schliesst auch
+        parallele Web-Vorgaenge untereinander aus (vorher konnte ein
+        Einzel-Update neben dem noch laufenden Sammel-Update dieselbe App
+        ein zweites Mal aktualisieren)."""
+        lock = try_acquire_update_lock(what)
+        if not lock:
+            self._send_json({"started": False, "error": busy_message()})
+            return
+        _set_update_state(state_key, done=False, ok=None, detail=None, progress=None)
+        _start_locked_job(lock, what, lambda: _update_state(state_key), target, *args)
+        self._send_json({"started": True})
+
+    def _restore_locked(self, app, restore_fn, *args):
+        """Restore stoppt Dienste und ersetzt Daten - darf weder neben einem
+        Update laufen noch von einem Portal-Neustart (Selbst-Update)
+        unterbrochen werden. Laeuft synchron in dieser Anfrage."""
+        what = f"Wiederherstellung {app['label']}"
+        lock = try_acquire_update_lock(what)
+        if not lock:
+            return False, busy_message()
+        with lock:
+            print(f"Gestartet: {what}", file=sys.stderr)
+            ok, detail = restore_fn(*args)
+            print(f"Beendet: {what} - {'ok' if ok else 'FEHLER'}: {detail}", file=sys.stderr)
+            return ok, detail
+
     def _not_found(self):
         self.send_response(404)
         self.end_headers()
@@ -3183,7 +3473,7 @@ class BaseHandler(BaseHTTPRequestHandler):
             if not filename:
                 self._send_html(render_restore_page(app, '<div class="msg err">Bitte ein Backup auswählen.</div>'))
                 return
-            ok, detail = restore_backup(app, location, filename)
+            ok, detail = self._restore_locked(app, restore_backup, app, location, filename)
             msg = (f'<div class="msg ok">✅ {detail}</div>' if ok else f'<div class="msg err">{detail}</div>')
             self._send_html(render_restore_page(app, msg))
             return
@@ -3201,7 +3491,7 @@ class BaseHandler(BaseHTTPRequestHandler):
                 self._send_html(render_restore_page(
                     app, '<div class="msg err">Keine Datei hochgeladen oder Datei nicht lesbar.</div>'))
                 return
-            ok, detail = restore_backup_from_bytes(app, data, filename)
+            ok, detail = self._restore_locked(app, restore_backup_from_bytes, app, data, filename)
             msg = (f'<div class="msg ok">✅ {detail}</div>' if ok else f'<div class="msg err">{detail}</div>')
             self._send_html(render_restore_page(app, msg))
             return
@@ -3245,12 +3535,7 @@ class BaseHandler(BaseHTTPRequestHandler):
             if not app:
                 self._not_found()
                 return
-            if _update_state(app["id"]).get("done") is False:
-                self._send_json({"started": False, "error": "Fuer diese App laeuft bereits ein Update."})
-                return
-            _update_state(app["id"]).update(done=False, ok=None, detail=None)
-            threading.Thread(target=_run_update_in_background, args=(app,), daemon=True).start()
-            self._send_json({"started": True})
+            self._start_update_job(app["id"], f"Update {app['label']}", _run_update_in_background, app)
             return
         m = re.match(r"^/update/run-install/([^/]+)$", path)
         if m:
@@ -3258,12 +3543,8 @@ class BaseHandler(BaseHTTPRequestHandler):
             if not app:
                 self._not_found()
                 return
-            if _update_state(app["id"]).get("done") is False:
-                self._send_json({"started": False, "error": "Fuer diese App laeuft bereits ein Vorgang."})
-                return
-            _update_state(app["id"]).update(done=False, ok=None, detail=None)
-            threading.Thread(target=_run_install_script_in_background, args=(app,), daemon=True).start()
-            self._send_json({"started": True})
+            self._start_update_job(app["id"], f"Komplett-Lauf (install.sh) {app['label']}",
+                                   _run_install_script_in_background, app)
             return
         m = re.match(r"^/companion/install/([^/]+)$", path)
         if m:
@@ -3276,20 +3557,18 @@ class BaseHandler(BaseHTTPRequestHandler):
             if get_app(comp_id):
                 self._send_json({"started": False, "error": f"{companion['label']} ist bereits installiert."})
                 return
-            if _companion_install_state(comp_id).get("done") is False:
-                self._send_json({"started": False, "error": "Installation läuft bereits."})
+            what = f"Installation {companion['label']}"
+            lock = try_acquire_update_lock(what)
+            if not lock:
+                self._send_json({"started": False, "error": busy_message()})
                 return
             _companion_install_state(comp_id).update(done=False, ok=None, detail=None)
-            threading.Thread(target=_run_companion_install_in_background, args=(companion,), daemon=True).start()
+            _start_locked_job(lock, what, lambda: _companion_install_state(comp_id),
+                              _run_companion_install_in_background, companion)
             self._send_json({"started": True})
             return
         if path == "/update/run-all":
-            if UPDATE_STATE.get("_all", {}).get("done", True) is False:
-                self._send_json({"started": False, "error": "Es laeuft bereits ein Sammel-Update."})
-                return
-            UPDATE_STATE["_all"] = {"done": False, "ok": None, "detail": None}
-            threading.Thread(target=_run_update_all_in_background, daemon=True).start()
-            self._send_json({"started": True})
+            self._start_update_job("_all", "Alle aktualisieren", _run_update_all_in_background)
             return
         m = re.match(r"^/update/switch/([^/]+)$", path)
         if m:
@@ -3303,12 +3582,8 @@ class BaseHandler(BaseHTTPRequestHandler):
             if not tag:
                 self._send_json({"started": False, "error": "Keine Version ausgewählt."})
                 return
-            if _update_state(app["id"]).get("done") is False:
-                self._send_json({"started": False, "error": "Fuer diese App laeuft bereits ein Update."})
-                return
-            _update_state(app["id"]).update(done=False, ok=None, detail=None)
-            threading.Thread(target=_run_version_switch_in_background, args=(app, tag), daemon=True).start()
-            self._send_json({"started": True})
+            self._start_update_job(app["id"], f"Versionswechsel {app['label']} auf {tag}",
+                                   _run_version_switch_in_background, app, tag)
             return
         m = re.match(r"^/update/settings/([^/]+)$", path)
         if m:
@@ -3366,6 +3641,7 @@ class BaseHandler(BaseHTTPRequestHandler):
 
 
 def main():
+    _load_update_state_at_start()
     server = ThreadingHTTPServer((HOST, PORT_LANDING), BaseHandler)
     print(f"Pi-Setup-Seite (v{PORTAL_VERSION}) laeuft dauerhaft auf {HOST}:{PORT_LANDING}", file=sys.stderr)
     server.serve_forever()
