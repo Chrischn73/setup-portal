@@ -123,7 +123,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote
 
-PORTAL_VERSION = "1.8.19"
+PORTAL_VERSION = "1.8.20"
 
 PORTAL_DIR = "/opt/setup-portal"
 # Jede App legt hier per eigenem install.sh genau eine Datei <app-id>.json
@@ -2934,6 +2934,38 @@ def perform_update(app, tarball_url, target_tag, progress=None):
     return True, f"Auf Version {target_tag} aktualisiert - {app['label']} läuft wieder."
 
 
+def _setup_nach_update(app, release, progress=None):
+    """Nach einem Update per Hand (Einzel-Update, "Alle aktualisieren"):
+    install.sh desselben Releases gleich mit ausfuehren, wenn es sich
+    gegenueber dem zuletzt vollstaendig ausgefuehrten Stand geaendert hat
+    und "Setup automatisch nachholen" an ist. Vorher kopierte ein Update per
+    Hand nur die Dateien aus der file_map, die Karte zeigte danach "Setup
+    unvollstaendig" und es brauchte einen zweiten Klick oder die Nacht
+    (2026-10-10). Laeuft im Thread des Updates und damit unter derselben
+    Update-Sperre - der von install.sh am Ende gestartete <app>-update-
+    check sieht die Sperre und startet keinen zweiten Lauf. Nicht beim
+    Wechsel auf eine aeltere Version (siehe _run_version_switch_in_
+    background()). Gibt None zurueck, wenn nichts zu tun war, sonst
+    (ok, Text zum Anhaengen an die Update-Meldung)."""
+    if not get_auto_install_sh(app["id"]) or not install_sh_changed(app, release["tag"]):
+        return None
+    if progress:
+        progress("Setup (install.sh) wird ausgeführt…")
+    try:
+        ok, detail, install_sh_hash = _download_and_run_install_script(
+            app["update"]["github_repo"], app.get("install_script_path", "setup/install.sh"),
+            app["label"], release=release)
+    except subprocess.TimeoutExpired:
+        ok, detail, install_sh_hash = False, "Ausführung hat zu lange gedauert (Timeout).", None
+    except Exception as e:
+        ok, detail, install_sh_hash = False, f"Unerwarteter Fehler: {e}", None
+    if ok and install_sh_hash:
+        _write_installed_install_sh_hash(app["id"], install_sh_hash)
+        return True, "Das geänderte Setup (install.sh) wurde gleich mit ausgeführt."
+    return False, (f"Das Setup (install.sh) ist dabei fehlgeschlagen - bitte „Setup jetzt nachholen“ "
+                   f"erneut versuchen. {detail}")
+
+
 def _run_update_in_background(app):
     # Sicherheitsnetz wie bei _run_format_in_background: ohne dieses
     # try/except wuerde eine unerwartete Ausnahme (z.B. in fetch_latest_
@@ -2948,6 +2980,11 @@ def _run_update_in_background(app):
             return
         ok, detail = perform_update(app, release["tarball_url"], release["tag"],
                                     progress=lambda text: _set_update_state(app_id, progress=text))
+        if ok:
+            setup = _setup_nach_update(app, release, progress=lambda text: _set_update_state(app_id, progress=text))
+            if setup:
+                ok = setup[0]
+                detail = f"{detail} {setup[1]}"
         run_update_check_once(app, allow_auto=False)
         _set_update_state(app_id, done=True, ok=ok, detail=detail)
     except Exception as e:
@@ -2997,8 +3034,13 @@ def _run_update_all_in_background():
             if parse_version(release["tag"]) <= parse_version(current):
                 results.append(f"✅ {app['label']}: bereits aktuell ({current}).")
                 continue
-            ok, detail = perform_update(app, release["tarball_url"], release["tag"],
-                                        progress=lambda text, p=prefix: _set_update_state("_all", progress=f"{p}: {text}"))
+            fortschritt = lambda text, p=prefix: _set_update_state("_all", progress=f"{p}: {text}")
+            ok, detail = perform_update(app, release["tarball_url"], release["tag"], progress=fortschritt)
+            if ok:
+                setup = _setup_nach_update(app, release, progress=fortschritt)
+                if setup:
+                    ok = setup[0]
+                    detail = f"{detail} {setup[1]}"
             run_update_check_once(app, allow_auto=False)
             overall_ok = overall_ok and ok
             results.append(f"{'✅' if ok else '❌'} {app['label']}: {detail}")
@@ -3008,7 +3050,7 @@ def _run_update_all_in_background():
         _set_update_state("_all", done=True, ok=False, detail=f"Unerwarteter Fehler: {e}")
 
 
-def _download_and_run_install_script(github_repo, install_script_path, label):
+def _download_and_run_install_script(github_repo, install_script_path, label, release=None):
     """Laedt das neueste GitHub-Release herunter und fuehrt darin das
     angegebene install.sh aus - bewusst KEIN Nachbau der Installationslogik
     hier (die steckt bereits vollstaendig, getestet und gepflegt in
@@ -3029,8 +3071,12 @@ def _download_and_run_install_script(github_repo, install_script_path, label):
     KEINE Exception weiter (Aufrufer muss trotzdem subprocess.TimeoutExpired/
     Exception selbst abfangen - die Ausnahmen aus urllib/tarfile hier drin
     sind bewusst NICHT gefangen, damit der Aufrufer seinen jeweils eigenen
-    State-Speicher im except-Block aktualisieren kann)."""
-    release = _fetch_latest_release_for_repo(github_repo)
+    State-Speicher im except-Block aktualisieren kann). 'release' (Dict wie
+    von fetch_latest_release()) legt fest, WELCHES Release ausgefuehrt wird -
+    nach einem Update dasselbe, das gerade installiert wurde (siehe
+    _setup_nach_update()); ohne Angabe das neueste."""
+    if release is None:
+        release = _fetch_latest_release_for_repo(github_repo)
     if not release or not release.get("tarball_url"):
         return False, github_limit_text() or "Neueste Version konnte nicht ermittelt werden.", None
     req = urllib.request.Request(release["tarball_url"], headers={"User-Agent": "Pi-Setup-Install-Run"})
@@ -3091,8 +3137,16 @@ def _run_install_script_in_background(app):
     vorhanden."""
     app_id = app["id"]
     try:
+        # install.sh der INSTALLIERTEN Version - dagegen vergleicht auch
+        # install_sh_out_of_sync(). Frueher immer das neueste Release; stand
+        # eine neuere Version schon bereit, passten Setup und Programmdateien
+        # danach nicht zusammen. Nicht gefunden (z. B. lokal gebaute
+        # Version ohne Release) -> wie bisher das neueste.
+        version = app_version(app)
+        release = fetch_release_by_tag(app, version) if version != "?" else None
         ok, detail, install_sh_hash = _download_and_run_install_script(
-            app["update"]["github_repo"], app.get("install_script_path", "setup/install.sh"), app["label"])
+            app["update"]["github_repo"], app.get("install_script_path", "setup/install.sh"), app["label"],
+            release=release)
         if ok and install_sh_hash:
             _write_installed_install_sh_hash(app_id, install_sh_hash)
         _set_update_state(app_id, done=True, ok=ok, detail=detail)
@@ -3155,7 +3209,7 @@ def render_update_card(app):
             # zaehlt bewusst als "geaendert", siehe install_sh_changed().
             if install_sh_changed(app, latest):
                 hints.append("Diese Version ändert auch das Setup (install.sh). "
-                             + ("Das holt die Box nach dem Update nachts automatisch nach."
+                             + ("Es läuft beim Update gleich mit (dauert 1–2 Minuten länger)."
                                 if auto_install_sh_on else
                                 "Nach dem Update unter „Weitere Optionen“ einmal komplett aktualisieren."))
             if hints:
