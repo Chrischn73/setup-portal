@@ -123,7 +123,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote
 
-PORTAL_VERSION = "1.8.17"
+PORTAL_VERSION = "1.8.18"
 
 PORTAL_DIR = "/opt/setup-portal"
 # Jede App legt hier per eigenem install.sh genau eine Datei <app-id>.json
@@ -2077,13 +2077,16 @@ def install_sh_out_of_sync(app):
     """True, wenn die INSTALLIERTE Version ein anderes install.sh mitbringt als
     das, mit dem zuletzt vollstaendig installiert wurde - klassischer Fall:
     ein normales (file_map-)Update lief, install.sh aber nie (neue Pakete/
-    Timer/Descriptor-Felder fehlen dann). Anders als install_sh_changed() NIE
-    True bei fehlendem Vergleichswert (z. B. frische Erstinstallation per SSH,
-    die keinen Hash schreibt) - sonst warnte jede neue Installation sofort
-    faelschlich - und NIE True, wenn install.sh nicht abrufbar ist."""
+    Timer/Descriptor-Felder fehlen dann). Fehlender Vergleichswert zaehlt
+    wie bei install_sh_changed() als "abweichend": Seit HonigBox v1.3.48/
+    BeeTown v2.9.46 schreibt install.sh den Hash auch bei einem Lauf per
+    SSH selbst - fehlt er, lief das Setup zuletzt mit einem aelteren
+    install.sh (2026-10-10: so blieb eine per SSH installierte HonigBox
+    ohne Hash unbemerkt auf dem Setup-Stand vom 6.10. - kein Systemcheck-
+    Timer, alter Name). NIE True, wenn install.sh nicht abrufbar ist."""
     gespeichert = _read_installed_install_sh_hash(app["id"])
     version = app_version(app)
-    if not gespeichert or version == "?":
+    if version == "?":
         return False
     raw = _fetch_raw_file(app["update"]["github_repo"], version,
                           app.get("install_script_path", "setup/install.sh"))
@@ -3181,7 +3184,7 @@ def render_self_update_card():
         status_line = f'<div class="msg warn small">ℹ️ Letzte Prüfung{when}: {html.escape(state["detail"])}</div>'
     return f"""
 <div class="msg app-section">
-<h2>🔧 Setup-Portal</h2>
+<h2>🔧 BeeTown Setup-Portal</h2>
 <div class="ver-line">Installiert: <strong>v{PORTAL_VERSION}</strong> {pill}</div>
 {action}
 {status_line}
