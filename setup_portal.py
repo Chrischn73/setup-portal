@@ -123,7 +123,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote
 
-PORTAL_VERSION = "1.8.15"
+PORTAL_VERSION = "1.8.16"
 
 PORTAL_DIR = "/opt/setup-portal"
 # Jede App legt hier per eigenem install.sh genau eine Datei <app-id>.json
@@ -204,6 +204,8 @@ def _set_update_state(app_id, **fields):
     im Vorgang nicht wie frueher als leere Fehlermeldung ("❌ null") endet,
     sondern beim naechsten Start als "unterbrochen" erkannt wird (siehe
     _load_update_state_at_start())."""
+    if fields.get("done") is True and "finished_at" not in fields:
+        fields["finished_at"] = time.time()
     with _UPDATE_STATE_LOCK:
         _update_state(app_id).update(fields)
         if not _PERSIST_UPDATE_STATE:
@@ -235,12 +237,13 @@ def _load_update_state_at_start():
         if not isinstance(state, dict):
             continue
         if state.get("done") is False:
-            state = {"done": True, "ok": False, "detail": INTERRUPTED_DETAIL}
+            state = dict(state, done=True, ok=False, detail=INTERRUPTED_DETAIL, progress=None,
+                         finished_at=time.time())
             print(f"Vorgang '{key}' wurde durch einen Neustart unterbrochen.", file=sys.stderr)
         _set_update_state(key, **state)
 
 
-def try_acquire_update_lock(what):
+def try_acquire_update_lock(what, state_key=None):
     """Gemeinsame Sperre fuer alles, was App-Dateien/-Dienste umbaut (Update,
     Versionswechsel, install.sh-Lauf, Restore) oder das Portal neu startet
     (Selbst-Update) - ueber ALLE Prozesse hinweg (Webserver, naechtliche
@@ -250,7 +253,9 @@ def try_acquire_update_lock(what):
     aktualisieren" neu und brach das BeeTown-Update ab. flock() statt
     PID-Datei: der Kernel gibt die Sperre frei, sobald der Prozess endet,
     auch bei einem Absturz. Gibt das offene Datei-Objekt zurueck (Freigabe =
-    close()) oder None, wenn die Sperre schon vergeben ist."""
+    close()) oder None, wenn die Sperre schon vergeben ist. state_key: App-ID
+    bzw. "_all" eines Web-Vorgangs - damit /update nach dem Neuladen (oder
+    in einem anderen Browser) den Fortschritt wieder anzeigen kann."""
     try:
         os.makedirs(RUN_DIR, exist_ok=True)
         f = open(UPDATE_LOCK_PATH, "a+")
@@ -263,7 +268,8 @@ def try_acquire_update_lock(what):
         return None
     f.seek(0)
     f.truncate()
-    json.dump({"pid": os.getpid(), "what": what, "since": time.strftime("%H:%M")}, f)
+    json.dump({"pid": os.getpid(), "what": what, "since": time.strftime("%H:%M"),
+               "started_at": time.time(), "state_key": state_key}, f)
     f.flush()
     return f
 
@@ -285,9 +291,10 @@ def acquire_update_lock_waiting(what, max_wait_s):
         time.sleep(5)
 
 
-def update_lock_holder():
-    """None, wenn die Sperre frei ist, sonst ein Text wie
-    "Update BeeTown HonigBox (seit 14:36)"."""
+def update_lock_info():
+    """None, wenn die Sperre frei ist, sonst die Angaben des Halters (what,
+    since, started_at, state_key, pid - einzelne koennen fehlen, z. B. wenn
+    er sie gerade erst schreibt)."""
     try:
         f = open(UPDATE_LOCK_PATH)
     except OSError:
@@ -300,9 +307,28 @@ def update_lock_holder():
                 info = json.loads(f.read() or "{}")
             except json.JSONDecodeError:
                 info = {}
-            what = info.get("what") or "ein anderer Vorgang"
-            return f"{what} (seit {info['since']})" if info.get("since") else what
+            return info if isinstance(info, dict) else {}
         return None
+
+
+def update_lock_holder():
+    """None, wenn die Sperre frei ist, sonst ein Text wie
+    "Update BeeTown HonigBox (seit 14:36)"."""
+    info = update_lock_info()
+    if info is None:
+        return None
+    what = info.get("what") or "ein anderer Vorgang"
+    return f"{what} (seit {info['since']})" if info.get("since") else what
+
+
+# Ab dieser Laufzeit zeigt /update einen Hinweis, dass etwas haengen koennte.
+# Laengster regulaerer Vorgang ist ein install.sh-Lauf (Timeout 30 Min.).
+LONG_RUNNING_S = 45 * 60
+
+
+def update_lock_elapsed_s(info):
+    started = info.get("started_at") if info else None
+    return max(0, int(time.time() - started)) if isinstance(started, (int, float)) else None
 
 
 def busy_message():
@@ -911,6 +937,7 @@ PAGE_UPDATE = """<!doctype html>
 {header}
 <h1>🔄 Update</h1>
 {message}
+{run_status}
 {app_sections}
 {all_update_button}
 {self_update_card}
@@ -925,7 +952,8 @@ function openUpdateModal(title, hint) {{
   var content = document.getElementById('update-modal-content');
   content.innerHTML = '<h1>' + SPINNER + title + '</h1>' +
     '<p class="update-progress" style="font-weight:600; min-height:1.4em;"></p>' +
-    '<p class="muted">' + hint + '</p>';
+    '<p class="muted">' + hint + '</p>' +
+    '<div class="update-long"></div>';
   document.getElementById('update-modal').classList.add('show');
   return content;
 }}
@@ -959,6 +987,7 @@ function updatePoll(appId, content) {{
     if (!d.done) {{
       var p = content.querySelector('.update-progress');
       if (p && d.progress) p.textContent = d.progress;
+      showLongHint(content.querySelector('.update-long'), d.elapsed_s, d.long_running_s);
       setTimeout(function() {{ updatePoll(appId, content); }}, 2000);
       return;
     }}
@@ -979,6 +1008,43 @@ function startJob(url, body, appId, content) {{
     if (!d.started) {{ showResult(content, false, d.error || 'Konnte nicht gestartet werden.'); return; }}
     updatePoll(appId, content);
   }}).catch(function() {{ updatePoll(appId, content); }});
+}}
+var CAN_REBOOT = {can_reboot};
+var LONG_HINT = {long_running_hint};
+// Hinweis + (auf dem Pi) Neustart-Button, wenn ein Vorgang ungewoehnlich lange
+// laeuft - sonst gaebe es keinen Ausweg aus einem haengenden Vorgang.
+function showLongHint(el, elapsed, limit) {{
+  if (!el || el.dataset.shown || !elapsed || !limit || elapsed < limit) return;
+  el.dataset.shown = '1';
+  var p = document.createElement('p');
+  p.textContent = '⚠️ ' + LONG_HINT;
+  el.appendChild(p);
+  if (CAN_REBOOT) {{
+    var f = document.createElement('form');
+    f.method = 'post';
+    f.action = '/system/reboot';
+    f.onsubmit = function() {{ return confirm('Pi jetzt neu starten? Der laufende Vorgang wird dabei abgebrochen.'); }};
+    var b = document.createElement('button');
+    b.type = 'submit';
+    b.className = 'btn-danger btn-small';
+    b.textContent = '🔄 Pi neu starten';
+    f.appendChild(b);
+    el.appendChild(f);
+  }}
+}}
+// Seite wurde geoeffnet, waehrend ein Web-Vorgang laeuft: Dialog wieder zeigen.
+function resumeJob(key, what) {{
+  var content = openUpdateModal(what + '…',
+    'Dieser Vorgang läuft bereits. Du kannst die Seite schließen, er läuft auf dem Gerät weiter.');
+  updatePoll(key, content);
+}}
+// Fremder Vorgang (naechtlicher Lauf, Selbst-Update): warten, dann neu laden.
+function watchLock() {{
+  fetch('/update/lock-status', {{cache: 'no-store'}}).then(r => r.json()).then(function(d) {{
+    if (!d.busy) {{ reloadWhenReachable(); return; }}
+    showLongHint(document.getElementById('lock-long'), d.elapsed_s, d.long_running_s);
+    setTimeout(watchLock, 5000);
+  }}).catch(function() {{ setTimeout(watchLock, 5000); }});
 }}
 function startUpdate(appId, tag) {{
   if (!confirm('Auf Version ' + tag + ' aktualisieren? Vorher wird automatisch ein Backup erstellt.')) {{
@@ -1052,6 +1118,7 @@ function startSelfUpdateCheck() {{
   }});
   return false;
 }}
+{run_status_js}
 </script>
 </body></html>
 """
@@ -3089,6 +3156,60 @@ GitHub-Releases von <code>{html.escape(SELF_UPDATE_GITHUB_REPO)}</code> - unabha
 </div>"""
 
 
+# Wie lange das Ergebnis des letzten Web-Vorgangs oben auf /update stehen bleibt.
+LAST_RESULT_SHOW_S = 24 * 3600
+
+LONG_RUNNING_HINT = ("Das dauert ungewöhnlich lange. Falls sich nichts mehr tut, hängt vermutlich "
+                     "etwas - ein Neustart des Geräts beendet den Vorgang und gibt alles wieder frei.")
+
+REBOOT_BUTTON = """<form method="post" action="/system/reboot" onsubmit="return confirm('Pi jetzt neu starten? Der laufende Vorgang wird dabei abgebrochen.');">
+  <button type="submit" class="btn-danger btn-small">🔄 Pi neu starten</button>
+</form>"""
+
+
+def _js_literal(value):
+    """Wert sicher in ein <script> einbetten."""
+    return json.dumps(value).replace("</", "<\\/")
+
+
+def render_run_status():
+    """Kopf der Update-Seite: Laeuft gerade ein Web-Vorgang, oeffnet die Seite
+    dessen Fortschrittsdialog wieder (Browser war zu, anderes Geraet, Seite
+    neu geladen). Laeuft etwas anderes (naechtlicher Lauf, Selbst-Update),
+    steht ein Hinweis da und die Seite laedt neu, sobald es fertig ist. Sonst
+    das Ergebnis des letzten Vorgangs (bis LAST_RESULT_SHOW_S). Gibt
+    (html, js) zurueck - js laeuft am Ende der Seite."""
+    info = update_lock_info()
+    if info is not None:
+        key = info.get("state_key")
+        if key and _update_state(key).get("done") is False:
+            what = info.get("what") or "Vorgang"
+            return "", f"resumeJob({_js_literal(key)}, {_js_literal(what)});"
+        elapsed = update_lock_elapsed_s(info)
+        long_hint = (f'<p>⚠️ {LONG_RUNNING_HINT}</p>' + (REBOOT_BUTTON if IS_PI else "")
+                     if elapsed is not None and elapsed >= LONG_RUNNING_S else "")
+        html_block = (
+            '<div class="msg" id="lock-banner">'
+            f'<p>⏳ Gerade läuft: <strong>{html.escape(update_lock_holder() or "ein anderer Vorgang")}</strong>. '
+            'Updates sind solange gesperrt - diese Seite lädt sich neu, sobald es fertig ist.</p>'
+            f'<div id="lock-long">{long_hint}</div></div>')
+        return html_block, "watchLock();"
+    latest = None
+    for state in UPDATE_STATE.values():
+        if state.get("done") and state.get("what") and isinstance(state.get("finished_at"), (int, float)):
+            if latest is None or state["finished_at"] > latest["finished_at"]:
+                latest = state
+    if not latest or time.time() - latest["finished_at"] > LAST_RESULT_SHOW_S:
+        return "", ""
+    ok = latest.get("ok")
+    cls, icon = ("ok", "✅") if ok else ("err", "❌")
+    when = time.strftime("%d.%m. %H:%M", time.localtime(latest["finished_at"]))
+    return (f'<div class="msg {cls}"><strong>{icon} Letzter Vorgang: {html.escape(latest["what"])}</strong> '
+            f'<span class="muted">(beendet {when})</span>'
+            f'<div style="white-space:pre-line; margin-top:.3rem;">{html.escape(latest.get("detail") or "")}</div>'
+            '</div>'), ""
+
+
 def render_update_overview(message=""):
     apps = load_apps()
     if not apps:
@@ -3101,9 +3222,14 @@ def render_update_overview(message=""):
             all_update_button = f'<form onsubmit="return startUpdateAll()"><button type="submit">{emojis} Alle aktualisieren</button></form>'
         else:
             all_update_button = ""
+    run_status, run_status_js = render_run_status()
     return PAGE_UPDATE.format(
         header=render_header(),
         message=message,
+        run_status=run_status,
+        run_status_js=run_status_js,
+        can_reboot="true" if IS_PI else "false",
+        long_running_hint=_js_literal(LONG_RUNNING_HINT),
         app_sections=app_sections,
         all_update_button=all_update_button,
         self_update_card=render_self_update_card(),
@@ -3246,11 +3372,12 @@ class BaseHandler(BaseHTTPRequestHandler):
         parallele Web-Vorgaenge untereinander aus (vorher konnte ein
         Einzel-Update neben dem noch laufenden Sammel-Update dieselbe App
         ein zweites Mal aktualisieren)."""
-        lock = try_acquire_update_lock(what)
+        lock = try_acquire_update_lock(what, state_key)
         if not lock:
             self._send_json({"started": False, "error": busy_message()})
             return
-        _set_update_state(state_key, done=False, ok=None, detail=None, progress=None)
+        _set_update_state(state_key, done=False, ok=None, detail=None, progress=None,
+                          what=what, started_at=time.time(), finished_at=None)
         _start_locked_job(lock, what, lambda: _update_state(state_key), target, *args)
         self._send_json({"started": True})
 
@@ -3398,7 +3525,16 @@ class BaseHandler(BaseHTTPRequestHandler):
             if app_id != "_all" and not get_app(app_id):
                 self._send_json({"done": True, "ok": None, "detail": None})
                 return
-            self._send_json(_update_state(app_id))
+            state = dict(_update_state(app_id))
+            if state.get("done") is False and isinstance(state.get("started_at"), (int, float)):
+                state["elapsed_s"] = int(time.time() - state["started_at"])
+                state["long_running_s"] = LONG_RUNNING_S
+            self._send_json(state)
+            return
+        if path == "/update/lock-status":
+            info = update_lock_info()
+            self._send_json({"busy": info is not None, "holder": update_lock_holder(),
+                             "elapsed_s": update_lock_elapsed_s(info), "long_running_s": LONG_RUNNING_S})
             return
         m = re.match(r"^/companion/install/status/([^/]+)$", path)
         if m:
