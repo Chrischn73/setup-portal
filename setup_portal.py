@@ -123,7 +123,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote
 
-PORTAL_VERSION = "1.8.18"
+PORTAL_VERSION = "1.8.19"
 
 PORTAL_DIR = "/opt/setup-portal"
 # Jede App legt hier per eigenem install.sh genau eine Datei <app-id>.json
@@ -2363,25 +2363,121 @@ def parse_version(v):
     return tuple(parts) or (0,)
 
 
+# GitHub erlaubt ohne Anmeldung nur 60 API-Abfragen pro Stunde - pro
+# oeffentlicher IP, also fuer ALLE Boxen hinter einem Router zusammen. Die
+# Update-Seite fragte bei jedem Aufruf live ab (ca. 5 Abfragen), mehrfaches
+# Neuladen auf mehreren Boxen leerte das Kontingent in wenigen Minuten
+# (2026-10-10). Deshalb Antworten im Webserver-Prozess GITHUB_CACHE_TTL_S
+# vorhalten; nach Ablauf oder bei einem Fehler wird die letzte gute Antwort
+# weiter genutzt. Die Laeufe per Timer/CLI sind eigene Prozesse und fragen
+# immer frisch. Ein von GitHub gemeldetes Limit wird bis zur Freigabe
+# beachtet (keine weiteren Abfragen, die es nur verlaengern koennten).
+GITHUB_CACHE_TTL_S = 600
+_github_cache = {}          # URL -> (Zeitpunkt, Antwort)
+_github_cache_lock = threading.Lock()
+_github_limit_bis = 0.0     # Unix-Zeit, bis zu der GitHub keine Abfragen annimmt
+
+
+def _merke_github_limit(e):
+    """Wertet eine HTTPError-Antwort von GitHub aus. True (und Sperrzeit
+    gemerkt), wenn es das Abfragelimit ist (403/429 mit
+    X-RateLimit-Remaining: 0 bzw. Retry-After), sonst False."""
+    global _github_limit_bis
+    if not isinstance(e, urllib.error.HTTPError) or e.code not in (403, 429) or e.headers is None:
+        return False
+    jetzt = time.time()
+    retry_after = e.headers.get("Retry-After")
+    if e.headers.get("X-RateLimit-Remaining") == "0":
+        try:
+            bis = float(e.headers.get("X-RateLimit-Reset") or 0)
+        except ValueError:
+            bis = 0
+        _github_limit_bis = max(bis, jetzt + 60)
+        return True
+    if retry_after and retry_after.isdigit():
+        _github_limit_bis = jetzt + int(retry_after)
+        return True
+    return False
+
+
+def github_limit_bis():
+    """Freigabezeitpunkt (Unix-Zeit), solange GitHub uns sperrt, sonst None."""
+    return _github_limit_bis if time.time() < _github_limit_bis else None
+
+
+def github_limit_text():
+    bis = github_limit_bis()
+    if not bis:
+        return None
+    return ("GitHub-Abfragelimit erreicht (ohne Anmeldung 60 Abfragen pro Stunde für alle Geräte "
+            f"an diesem Internetanschluss zusammen) - wieder ab {time.strftime('%H:%M', time.localtime(bis))} Uhr.")
+
+
+def github_limit_kurz():
+    """Kurzfassung fuer die einzelnen Karten - die Erklaerung steht einmal
+    oben auf der Update-Seite (render_update_overview())."""
+    bis = github_limit_bis()
+    if not bis:
+        return None
+    return f"Wieder ab {time.strftime('%H:%M', time.localtime(bis))} Uhr - Seite dann neu laden."
+
+
+def _github_fehlertext(e):
+    """Lesbarer Fehlertext fuer Downloads von GitHub (Tarballs zaehlen
+    ebenfalls zum API-Limit)."""
+    if _merke_github_limit(e):
+        return github_limit_text()
+    return str(e)
+
+
+def _github_cache_leeren():
+    with _github_cache_lock:
+        _github_cache.clear()
+
+
+def _github_get(url, json_antwort=True, timeout=15):
+    """GET auf GitHub mit Zwischenspeicher (siehe GITHUB_CACHE_TTL_S). Gibt
+    die geparste JSON-Antwort bzw. die Rohdaten zurueck, bei jedem Fehler
+    die letzte gute Antwort oder None."""
+    jetzt = time.time()
+    with _github_cache_lock:
+        eintrag = _github_cache.get(url)
+    if eintrag and jetzt - eintrag[0] < GITHUB_CACHE_TTL_S:
+        return eintrag[1]
+    alt = eintrag[1] if eintrag else None
+    if github_limit_bis():
+        return alt
+    headers = {"User-Agent": "Pi-Setup-Update-Check"}
+    if json_antwort:
+        headers["Accept"] = "application/vnd.github+json"
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            roh = resp.read()
+        daten = json.loads(roh.decode("utf-8")) if json_antwort else roh
+    except urllib.error.HTTPError as e:
+        _merke_github_limit(e)
+        return alt
+    except (urllib.error.URLError, OSError, json.JSONDecodeError, ValueError):
+        return alt
+    with _github_cache_lock:
+        _github_cache[url] = (jetzt, daten)
+    return daten
+
+
 def _fetch_latest_release_for_repo(repo):
     """Kern von fetch_latest_release() - auf den blanken Repo-String
     ('Nutzer/Repo') statt auf ein volles App-Objekt bezogen, damit auch das
     Nachinstallieren einer noch unregistrierten Partner-App (die ja noch
     kein app['update']-Objekt hat) dieselbe Abfrage nutzen kann."""
-    try:
-        req = urllib.request.Request(
-            f"https://api.github.com/repos/{repo}/releases/latest",
-            headers={"Accept": "application/vnd.github+json", "User-Agent": "Pi-Setup-Update-Check"},
-        )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        tag = data.get("tag_name") or ""
-        if not tag:
-            return None
-        return {"tag": tag, "notes": (data.get("body") or "").strip(), "tarball_url": data.get("tarball_url") or "",
-                "published_at": data.get("published_at") or ""}
-    except (urllib.error.URLError, OSError, json.JSONDecodeError, ValueError):
+    data = _github_get(f"https://api.github.com/repos/{repo}/releases/latest")
+    if not isinstance(data, dict):
         return None
+    tag = data.get("tag_name") or ""
+    if not tag:
+        return None
+    return {"tag": tag, "notes": (data.get("body") or "").strip(), "tarball_url": data.get("tarball_url") or "",
+            "published_at": data.get("published_at") or ""}
 
 
 def _fetch_raw_file(repo, tag, path, timeout=15):
@@ -2391,16 +2487,11 @@ def _fetch_raw_file(repo, tag, path, timeout=15):
     letzten vollstaendigen Lauf zu pruefen (siehe render_update_card()),
     ohne bei jedem Update-Check den ganzen Tarball zu laden. Gibt None bei
     jedem Fehler zurueck (fehlende Datei, kein Internet, o.ae.) - der
-    Aufrufer behandelt das dann als "unbekannt", nicht als Absturz."""
-    try:
-        req = urllib.request.Request(
-            f"https://raw.githubusercontent.com/{repo}/{tag}/{path}",
-            headers={"User-Agent": "Pi-Setup-Update-Check"},
-        )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.read()
-    except (urllib.error.URLError, OSError):
-        return None
+    Aufrufer behandelt das dann als "unbekannt", nicht als Absturz.
+    Zaehlt nicht zum API-Limit, wird aber genauso zwischengespeichert (der
+    Inhalt eines Tags aendert sich nicht, und die Seite laedt schneller)."""
+    return _github_get(f"https://raw.githubusercontent.com/{repo}/{tag}/{path}",
+                       json_antwort=False, timeout=timeout)
 
 
 SELF_UPDATE_GITHUB_REPO = "Chrischn73/setup-portal"
@@ -2455,7 +2546,8 @@ def _self_update():
     release = _fetch_latest_release_for_repo(SELF_UPDATE_GITHUB_REPO)
     if not release or not release.get("tarball_url"):
         print("Konnte keine Release-Information abrufen.", file=sys.stderr)
-        _write_self_update_state(True, False, "Konnte keine Release-Information von GitHub abrufen.")
+        _write_self_update_state(True, False, github_limit_text()
+                                 or "Konnte keine Release-Information von GitHub abrufen.")
         return
     if parse_version(release["tag"]) <= parse_version(PORTAL_VERSION):
         print(f"Bereits aktuell (neueste Version: {release['tag']}).", file=sys.stderr)
@@ -2570,36 +2662,27 @@ def fetch_latest_release(app):
 
 def fetch_all_releases(app, limit=10):
     repo = app["update"]["github_repo"]
+    data = _github_get(f"https://api.github.com/repos/{repo}/releases?per_page={limit}")
+    if not isinstance(data, list):
+        return []
     try:
-        req = urllib.request.Request(
-            f"https://api.github.com/repos/{repo}/releases?per_page={limit}",
-            headers={"Accept": "application/vnd.github+json", "User-Agent": "Pi-Setup-Update-Check"},
-        )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
         return [{"tag": r["tag_name"], "tarball_url": r.get("tarball_url") or "",
                   "notes": (r.get("body") or "").strip(), "published_at": r.get("published_at") or "",
                   "prerelease": bool(r.get("prerelease"))}
                 for r in data if r.get("tag_name") and r["tag_name"] != STATS_RELEASE_TAG]
-    except (urllib.error.URLError, OSError, json.JSONDecodeError, ValueError, KeyError):
+    except (KeyError, AttributeError, TypeError):
         return []
 
 
 def fetch_release_by_tag(app, tag):
     repo = app["update"]["github_repo"]
-    try:
-        req = urllib.request.Request(
-            f"https://api.github.com/repos/{repo}/releases/tags/{quote(tag, safe='')}",
-            headers={"Accept": "application/vnd.github+json", "User-Agent": "Pi-Setup-Update-Check"},
-        )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        tag_name = data.get("tag_name") or ""
-        if not tag_name:
-            return None
-        return {"tag": tag_name, "notes": (data.get("body") or "").strip(), "tarball_url": data.get("tarball_url") or ""}
-    except (urllib.error.URLError, OSError, json.JSONDecodeError, ValueError):
+    data = _github_get(f"https://api.github.com/repos/{repo}/releases/tags/{quote(tag, safe='')}")
+    if not isinstance(data, dict):
         return None
+    tag_name = data.get("tag_name") or ""
+    if not tag_name:
+        return None
+    return {"tag": tag_name, "notes": (data.get("body") or "").strip(), "tarball_url": data.get("tarball_url") or ""}
 
 
 def get_auto_update(app_id):
@@ -2798,7 +2881,7 @@ def perform_update(app, tarball_url, target_tag, progress=None):
         with urllib.request.urlopen(req, timeout=60) as resp:
             archive_data = resp.read()
     except (urllib.error.URLError, OSError) as e:
-        return False, f"Herunterladen fehlgeschlagen: {e}"
+        return False, f"Herunterladen fehlgeschlagen: {_github_fehlertext(e)}"
 
     services = app["update"].get("services_to_restart", [])
 
@@ -2949,10 +3032,13 @@ def _download_and_run_install_script(github_repo, install_script_path, label):
     State-Speicher im except-Block aktualisieren kann)."""
     release = _fetch_latest_release_for_repo(github_repo)
     if not release or not release.get("tarball_url"):
-        return False, "Neueste Version konnte nicht ermittelt werden.", None
+        return False, github_limit_text() or "Neueste Version konnte nicht ermittelt werden.", None
     req = urllib.request.Request(release["tarball_url"], headers={"User-Agent": "Pi-Setup-Install-Run"})
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        archive_data = resp.read()
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            archive_data = resp.read()
+    except urllib.error.HTTPError as e:
+        return False, f"Herunterladen fehlgeschlagen: {_github_fehlertext(e)}", None
     with tempfile.TemporaryDirectory() as tmpdir:
         with tarfile.open(fileobj=io.BytesIO(archive_data), mode="r:gz") as tar:
             tar.extractall(path=tmpdir, filter="data")
@@ -3038,7 +3124,10 @@ def render_update_card(app):
     update_tag = None
     blocks = []
 
-    if release is None:
+    if release is None and github_limit_bis():
+        pill = _version_pill("GitHub-Limit erreicht", "warn")
+        blocks.append(f'<p class="muted small">{html.escape(github_limit_kurz())}</p>')
+    elif release is None:
         pill = _version_pill("GitHub nicht erreichbar", "err")
         blocks.append('<p class="muted small">Neueste Version konnte nicht abgerufen werden - '
                       'hat das Gerät Internet? Seite später neu laden.</p>')
@@ -3163,7 +3252,11 @@ def render_self_update_card():
     aufgeschoben)."""
     release = _fetch_latest_release_for_repo(SELF_UPDATE_GITHUB_REPO)
     action = ""
-    if release is None:
+    if release is None and github_limit_bis():
+        pill_kind = "warn"
+        pill = _version_pill("GitHub-Limit erreicht", "warn")
+        action = f'<p class="muted small">{html.escape(github_limit_kurz())}</p>'
+    elif release is None:
         pill_kind = "err"
         pill = _version_pill("GitHub nicht erreichbar", "err")
     elif parse_version(release["tag"]) > parse_version(PORTAL_VERSION):
@@ -3269,6 +3362,9 @@ def render_update_overview(message=""):
                        f'<p class="small" style="margin:.4rem 0 0;">{names}</p>'
                        f'<form onsubmit="return startUpdateAll()"><button type="submit">{emojis} Alle aktualisieren</button></form>'
                        '</div>')
+    self_update_card = render_self_update_card()
+    if github_limit_text():
+        summary = f'<div class="msg warn small">ℹ️ {html.escape(github_limit_text())}</div>' + summary
     run_status, run_status_js = render_run_status()
     return PAGE_UPDATE.format(
         header=render_header(),
@@ -3279,7 +3375,7 @@ def render_update_overview(message=""):
         can_reboot="true" if IS_PI else "false",
         long_running_hint=_js_literal(LONG_RUNNING_HINT),
         app_sections=app_sections,
-        self_update_card=render_self_update_card(),
+        self_update_card=self_update_card,
     )
 
 
@@ -3617,6 +3713,11 @@ class BaseHandler(BaseHTTPRequestHandler):
         if self.handle_system_action():
             return
         path = self.path.split("?", 1)[0]
+        # Vor einer Update-Aktion frisch von GitHub holen statt aus dem
+        # Zwischenspeicher - sonst liefe z. B. "Setup nachholen" kurz nach
+        # einem neuen Release noch mit dem alten install.sh.
+        if re.match(r"^/(update/(run|run-install|switch)/[^/]+|update/run-all|companion/install/[^/]+)$", path):
+            _github_cache_leeren()
 
         m = re.match(r"^/backup/create/([^/]+)$", path)
         if m:
@@ -3784,6 +3885,9 @@ class BaseHandler(BaseHTTPRequestHandler):
             self._send_html(render_update_overview(msg))
             return
         if path == "/update/self-update-check":
+            # Ausdruecklich "jetzt pruefen": danach die Seite nicht mit
+            # zwischengespeicherten Release-Daten anzeigen.
+            _github_cache_leeren()
             started, error = trigger_self_update_check()
             if not started:
                 self._send_json({"started": False, "error": error})
