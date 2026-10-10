@@ -246,6 +246,7 @@ STYLE = """
   .header {{ display: flex; align-items: center; gap: .6rem; margin-bottom: 1rem; }}
   .header .logo {{ font-size: 1.8rem; }}
   .header .name {{ font-weight: bold; font-size: 1.1rem; }}
+  .header .name-sub {{ font-size: .78em; font-weight: 650; }}
   .header .portal-version {{ display: block; font-weight: normal; font-size: .7rem; opacity: .6; }}
   .btn-row {{ display: flex; gap: .5rem; margin-top: 1.5rem; }}
   .btn-row form {{ flex: 1; margin: 0; }}
@@ -1033,7 +1034,7 @@ def app_url(app, request_host=None):
 
 def _apps_heading():
     """(Emoji-Praefix, Titel-Text) fuer Header/Landing-Titel. Nutzerwunsch
-    2026-08-10: fest auf "BeeTown-Setup-Portal" statt frueher dynamisch aus
+    2026-08-10: fest auf "BeeTown Setup-Portal" statt frueher dynamisch aus
     Anzahl registrierter Apps/IS_PI abgeleitet (z.B. "BeeTown-Pi" vs.
     "BeeTown-Setup" je nach Geraet) - verwirrte mehr, als es half, sobald
     HonigBox und die Imkerei-App (beide unter der Marke "BeeTown") auf
@@ -1041,14 +1042,23 @@ def _apps_heading():
     ueber apps.d/*.json konfigurierbar (anders als donate/companion/
     beschreibung) - der Nutzer hat nur genau diese beiden BeeTown-Apps,
     ein generischer Mechanismus wuerde hier keinen echten Zweck erfuellen."""
-    return "🐝", "BeeTown-Setup-Portal"
+    return "🐝", "BeeTown Setup-Portal"
+
+
+def _heading_html(text):
+    """Erstes Wort gross, Rest kleiner (einheitlich mit BeeTown/HonigBox:
+    "BeeTown" gross, Zusatz wie "Setup-Portal" kleiner dahinter)."""
+    first, _, rest = text.partition(" ")
+    if not rest:
+        return html.escape(text)
+    return f'{html.escape(first)} <span class="name-sub">{html.escape(rest)}</span>'
 
 
 def render_header():
     emoji, text = _apps_heading()
     return (f'<div class="header"><span class="logo">{emoji or "🐝"}</span>'
-            f'<div class="name">{html.escape(text)}'
-            f'<span class="portal-version">Setup-Portal v{PORTAL_VERSION}</span></div></div>')
+            f'<div class="name">{_heading_html(text)}'
+            f'<span class="portal-version">v{PORTAL_VERSION}</span></div></div>')
 
 
 def render_app_beschreibungen():
