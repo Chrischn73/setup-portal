@@ -123,7 +123,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote
 
-PORTAL_VERSION = "1.8.21"
+PORTAL_VERSION = "1.8.22"
 
 PORTAL_DIR = "/opt/setup-portal"
 # Jede App legt hier per eigenem install.sh genau eine Datei <app-id>.json
@@ -2966,7 +2966,7 @@ def perform_update(app, tarball_url, target_tag, progress=None):
         return False, f"Fehler beim Aktualisieren: {e}"
 
     _restart_services()
-    return True, f"Auf Version {target_tag} aktualisiert - {app['label']} läuft wieder."
+    return True, f"Auf Version {target_tag} aktualisiert."
 
 
 def _setup_nach_update(app, release, progress=None):
@@ -2981,7 +2981,8 @@ def _setup_nach_update(app, release, progress=None):
     check sieht die Sperre und startet keinen zweiten Lauf. Nicht beim
     Wechsel auf eine aeltere Version (siehe _run_version_switch_in_
     background()). Gibt None zurueck, wenn nichts zu tun war, sonst
-    (ok, Text zum Anhaengen an die Update-Meldung)."""
+    (ok, Zusatz) - der Aufrufer haengt den Zusatz per _mit_setup() an die
+    Update-Meldung an: "Auf Version vX aktualisiert (inkl. install.sh)."."""
     if not get_auto_install_sh(app["id"]) or not install_sh_changed(app, release["tag"]):
         return None
     if progress:
@@ -2996,9 +2997,14 @@ def _setup_nach_update(app, release, progress=None):
         ok, detail, install_sh_hash = False, f"Unerwarteter Fehler: {e}", None
     if ok and install_sh_hash:
         _write_installed_install_sh_hash(app["id"], install_sh_hash)
-        return True, "Das geänderte Setup (install.sh) wurde gleich mit ausgeführt."
-    return False, (f"Das Setup (install.sh) ist dabei fehlgeschlagen - bitte „Setup jetzt nachholen“ "
+        return True, " (inkl. install.sh)."
+    return False, (f", aber install.sh ist fehlgeschlagen - bitte „Setup jetzt nachholen“ "
                    f"erneut versuchen. {detail}")
+
+
+def _mit_setup(detail, setup):
+    """Update-Meldung um das Ergebnis von _setup_nach_update() ergaenzen."""
+    return detail.rstrip(".") + setup[1]
 
 
 def _run_update_in_background(app):
@@ -3019,7 +3025,7 @@ def _run_update_in_background(app):
             setup = _setup_nach_update(app, release, progress=lambda text: _set_update_state(app_id, progress=text))
             if setup:
                 ok = setup[0]
-                detail = f"{detail} {setup[1]}"
+                detail = _mit_setup(detail, setup)
         run_update_check_once(app, allow_auto=False)
         _set_update_state(app_id, done=True, ok=ok, detail=detail)
     except Exception as e:
@@ -3075,7 +3081,7 @@ def _run_update_all_in_background():
                 setup = _setup_nach_update(app, release, progress=fortschritt)
                 if setup:
                     ok = setup[0]
-                    detail = f"{detail} {setup[1]}"
+                    detail = _mit_setup(detail, setup)
             run_update_check_once(app, allow_auto=False)
             overall_ok = overall_ok and ok
             results.append(f"{'✅' if ok else '❌'} {app['label']}: {detail}")
