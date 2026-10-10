@@ -104,8 +104,11 @@ Nur Python-Standardbibliothek.
 import fcntl
 import hashlib
 import html
+import http.client
 import io
+import ipaddress
 import json
+import mmap
 import os
 import re
 import shlex
@@ -121,9 +124,9 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, quote, unquote
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 
-PORTAL_VERSION = "1.8.22"
+PORTAL_VERSION = "1.8.23"
 
 PORTAL_DIR = "/opt/setup-portal"
 # Jede App legt hier per eigenem install.sh genau eine Datei <app-id>.json
@@ -486,14 +489,37 @@ SPINNER_SVG = (
 
 SYSTEM_BUTTONS = """
 <div class="btn-row">
-<form method="post" action="/system/reboot" onsubmit="return confirm('Pi wirklich neu starten?');">
+<form method="post" action="/system/reboot" onsubmit="return confirm({reboot_frage});">
   <button type="submit" class="btn-danger btn-small">🔄 Neu starten</button>
 </form>
-<form method="post" action="/system/shutdown" onsubmit="return confirm('Pi wirklich herunterfahren? Danach muss der Strom manuell getrennt und wieder verbunden werden, um ihn erneut zu starten.');">
+<form method="post" action="/system/shutdown" onsubmit="return confirm({shutdown_frage});">
   <button type="submit" class="btn-danger btn-small">⏻ Herunterfahren</button>
 </form>
 </div>
 """
+
+
+def _neustart_warnungen():
+    """Zusatzhinweise fuer Neustart/Herunterfahren: ein gerade laufender
+    Vorgang (Update, install.sh) und die optionalen "reboot_warnung"-Texte
+    der Apps (HonigBox: nicht archivierte Fotos im RAM gehen verloren)."""
+    warnungen = []
+    laeuft = update_lock_holder()
+    if laeuft:
+        warnungen.append(f"Gerade läuft: {laeuft} - ein Neustart bricht das ab.")
+    for app in load_apps():
+        if app.get("reboot_warnung"):
+            warnungen.append(str(app["reboot_warnung"]))
+    return warnungen
+
+
+def render_system_buttons():
+    zusatz = "".join("\n\n" + w for w in _neustart_warnungen())
+    frage = lambda text: html.escape(json.dumps(text + zusatz))
+    return SYSTEM_BUTTONS.format(
+        reboot_frage=frage("Pi wirklich neu starten?"),
+        shutdown_frage=frage("Pi wirklich herunterfahren? Danach muss der Strom manuell getrennt und "
+                             "wieder verbunden werden, um ihn erneut zu starten."))
 
 PAGE_LANDING = """<!doctype html>
 <html lang="de"><head>
@@ -798,6 +824,7 @@ PAGE_CONNECTING = """<!doctype html>
 </div>
 <a class="btn" href="/">← Zurück zur Übersicht</a>
 <script>
+function esc(t) {{ var d = document.createElement('div'); d.textContent = t; return d.innerHTML; }}
 (function poll() {{
   fetch('/wifi/status').then(r => r.json()).then(data => {{
     if (!data.done) {{ setTimeout(poll, 1500); return; }}
@@ -810,7 +837,7 @@ PAGE_CONNECTING = """<!doctype html>
       }}, 2500);
     }} else {{
       el.innerHTML = '<div class="msg err">❌ Verbindung fehlgeschlagen'
-        + (data.detail ? ': ' + data.detail : '') + '</div>'
+        + (data.detail ? ': ' + esc(data.detail) : '') + '</div>'
         + '<a class="btn" href="/wifi">Zurück zu den WLAN-Einstellungen</a>';
     }}
   }}).catch(() => setTimeout(poll, 1500));
@@ -1042,7 +1069,7 @@ function showLongHint(el, elapsed, limit) {{
   if (CAN_REBOOT) {{
     var f = document.createElement('form');
     f.method = 'post';
-    f.action = '/system/reboot';
+    f.action = '/system/reboot?force=1';
     f.onsubmit = function() {{ return confirm('Pi jetzt neu starten? Der laufende Vorgang wird dabei abgebrochen.'); }};
     var b = document.createElement('button');
     b.type = 'submit';
@@ -1156,6 +1183,25 @@ PAGE_SYSTEM_ACTION = """<!doctype html>
 <h1>""" + SPINNER_SVG + """Pi {verb}…</h1>
 <p>{hint}</p>
 {retry_script}
+</body></html>
+"""
+
+PAGE_SYSTEM_ACTION_BESTAETIGEN = """<!doctype html>
+<html lang="de"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vorgang läuft</title>
+<style>""" + STYLE + """</style>
+</head><body>
+{header}
+<div class="msg err">⚠️ Gerade läuft: {laeuft}. Wenn der Pi jetzt {aktion} wird, bricht das
+diesen Vorgang ab - eine App kann danach halb aktualisiert sein.</div>
+<p>Besser abwarten, bis der Vorgang fertig ist (Seite „Update“ zeigt den Fortschritt).</p>
+<div class="btn-row">
+<a class="btn" href="/">← Abbrechen</a>
+<form method="post" action="{pfad}?force=1">
+  <button type="submit" class="btn-danger btn-small">Trotzdem {aktion}</button>
+</form>
+</div>
 </body></html>
 """
 
@@ -1290,6 +1336,68 @@ def _host_without_port(host):
         idx = host.rfind("]")
         return host[:idx + 1] if idx != -1 else host
     return host.rsplit(":", 1)[0] if ":" in host else host
+
+
+# Schutz gegen fremde Webseiten: Das Portal hat bewusst keinen Login (LAN),
+# aber jede Internetseite, die ein Geraet im Heimnetz oeffnet, konnte per
+# Formular-Autosubmit bzw. fetch(no-cors) schreibende Aktionen ausloesen
+# (Herunterfahren, USB-Stick formatieren, Backup einspielen) und ueber DNS-
+# Rebinding sogar Backups mit Pushover-/Telegram-Tokens lesen. Deshalb:
+# Host-Header nur mit lokalen Namen/IPs, und bei POST muss Origin/Referer
+# zum Host passen. Weitere Namen: SETUP_PORTAL_ERLAUBTE_HOSTS (kommagetrennt)
+# in /etc/default/setup-portal.
+_LOKALE_HOST_ENDUNGEN = (".local", ".lan", ".home", ".home.arpa", ".internal", ".intranet",
+                         ".localdomain", ".fritz.box", ".box")
+
+
+def _host_erlaubt(host_header):
+    name = _host_without_port((host_header or "").strip()).strip("[]").lower().rstrip(".")
+    if not name or "." not in name or name.endswith(_LOKALE_HOST_ENDUNGEN):
+        return True
+    try:
+        ipaddress.ip_address(name)
+        return True
+    except ValueError:
+        pass
+    if name in (socket.gethostname().lower(), socket.getfqdn().lower()):
+        return True
+    extra = os.environ.get("SETUP_PORTAL_ERLAUBTE_HOSTS", "")
+    return name in {h.strip().lower() for h in extra.split(",") if h.strip()}
+
+
+def _herkunft_passt(origin, referer, host_header):
+    """True, wenn ein POST von einer Seite dieses Portals selbst kommt.
+    Ohne Origin und Referer (curl, Skripte) erlaubt - Browser schicken bei
+    POST immer einen Origin."""
+    quelle = origin or referer
+    if not quelle:
+        return True
+    if quelle == "null":
+        return False
+    try:
+        netloc = urlsplit(quelle).netloc
+    except ValueError:
+        return False
+    return netloc.lower() == (host_header or "").strip().lower()
+
+
+# Markierungen fuer Neustarts, die das Portal ohne Login ausloest (Update,
+# Wiederherstellung, install.sh, "Neu starten"): Die Apps oeffnen nach einem
+# so ausgeloesten Start kein Passwort-Reset-Fenster - sonst koennte jeder im
+# LAN per Portal-Klick (oder durch Abpassen des Auto-Updates) ein neues
+# Passwort setzen. Gelesen von honigbox galerie_server.py / imker-app server.py.
+AUTO_NEUSTART_DIR = "/var/lib/beetown-auto-neustart"
+
+
+def markiere_auto_neustart(namen):
+    try:
+        os.makedirs(AUTO_NEUSTART_DIR, mode=0o755, exist_ok=True)
+        for name in namen:
+            if re.fullmatch(r"[A-Za-z0-9@._-]+", name or ""):
+                with open(os.path.join(AUTO_NEUSTART_DIR, name), "w") as f:
+                    f.write(f"{int(time.time())}\n")
+    except OSError:
+        pass
 
 
 def app_url(app, request_host=None):
@@ -1439,7 +1547,9 @@ def all_ips():
 def status_banner():
     ssid, connected = current_wifi_connection()
     if connected:
-        return f'<div class="msg ok">📶 Aktuell verbunden mit <strong>{ssid}</strong></div>'
+        # html.escape: Der WLAN-Name kommt von aussen (jeder Nachbar kann ein
+        # Netz z. B. "<script src=…>" nennen) und darf nie als HTML wirken.
+        return f'<div class="msg ok">📶 Aktuell verbunden mit <strong>{html.escape(ssid)}</strong></div>'
     return '<div class="msg err">📡 Kein WLAN verbunden</div>'
 
 
@@ -1574,6 +1684,7 @@ def _restore_from_tar(app, tar, label):
     post_hook = backup_cfg.get("post_restore_hook")
 
     def _restart_services():
+        markiere_auto_neustart(start_services)
         for svc in start_services:
             subprocess.run(["systemctl", "start", svc], capture_output=True, text=True)
 
@@ -1657,36 +1768,63 @@ def restore_backup(app, location, filename):
         return False, f"Fehler beim Lesen des Archivs: {e}"
 
 
-def restore_backup_from_bytes(app, data, filename):
+def restore_backup_from_file(app, pfad, filename):
     try:
-        with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
+        with tarfile.open(pfad, mode="r:gz") as tar:
             return _restore_from_tar(app, tar, filename or "der hochgeladenen Datei")
-    except (tarfile.TarError, OSError) as e:
+    except (tarfile.TarError, OSError, EOFError) as e:
         return False, f"Fehler beim Lesen der hochgeladenen Datei: {e}"
 
 
-def parse_multipart_file(body, content_type):
-    """Sehr einfacher multipart/form-data-Parser fuer genau EIN Datei-Feld
-    (keine externen Abhaengigkeiten, Python-Standardbibliothek reicht).
-    Gibt (dateiname, bytes) oder (None, None) zurueck."""
+# Hochgeladene Backups landen auf der Platte statt im RAM: frueher lag die
+# Datei per rfile.read() + split()/Slicing bis zu viermal im Speicher - ein
+# Imker-App-Backup mit Fotos (mehrere 100 MB) liess auf einem Pi den
+# OOM-Killer zuschlagen. /var/tmp statt /tmp: /tmp ist unter Debian 13 RAM.
+UPLOAD_TMP_DIR = "/var/tmp"
+
+
+def upload_in_datei_lesen(rfile, laenge, ziel):
+    rest = laenge
+    while rest > 0:
+        block = rfile.read(min(rest, 1024 * 1024))
+        if not block:
+            break
+        ziel.write(block)
+        rest -= len(block)
+    ziel.flush()
+
+
+def parse_multipart_datei(quelle, content_type, ziel):
+    """multipart/form-data-Parser fuer genau EIN Datei-Feld, arbeitet per
+    mmap auf der hochgeladenen Datei 'quelle' und schreibt den Dateiinhalt
+    blockweise nach 'ziel' (Pfad). Gibt den Dateinamen zurueck oder None."""
     m = re.search(r'boundary="?([^";]+)"?', content_type)
-    if not m:
-        return None, None
+    if not m or os.path.getsize(quelle) == 0:
+        return None
     boundary = ("--" + m.group(1)).encode()
-    for part in body.split(boundary):
-        if b"Content-Disposition" not in part:
-            continue
-        header_end = part.find(b"\r\n\r\n")
-        if header_end == -1:
-            continue
-        headers = part[:header_end].decode("utf-8", "replace")
-        data = part[header_end + 4:]
-        if data.endswith(b"\r\n"):
-            data = data[:-2]
-        fm = re.search(r'filename="([^"]*)"', headers)
-        if fm and fm.group(1):
-            return fm.group(1), data
-    return None, None
+    with open(quelle, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+        pos = mm.find(boundary)
+        while pos != -1:
+            naechste = mm.find(boundary, pos + len(boundary))
+            if naechste == -1:
+                break
+            teil_start = pos + len(boundary)
+            header_ende = mm.find(b"\r\n\r\n", teil_start, naechste)
+            if header_ende != -1:
+                headers = mm[teil_start:header_ende].decode("utf-8", "replace")
+                fm = re.search(r'filename="([^"]*)"', headers)
+                if "Content-Disposition" in headers and fm and fm.group(1):
+                    start, ende = header_ende + 4, naechste
+                    if mm[ende - 2:ende] == b"\r\n":
+                        ende -= 2
+                    if ende <= start:
+                        return None
+                    with open(ziel, "wb") as out:
+                        for i in range(start, ende, 1024 * 1024):
+                            out.write(mm[i:min(i + 1024 * 1024, ende)])
+                    return fm.group(1)
+            pos = naechste
+    return None
 
 
 def get_max_backups():
@@ -2551,6 +2689,37 @@ def read_self_update_check_state():
         return {"done": True, "ok": None, "detail": None}
 
 
+def _dateien_atomar_ersetzen(paare):
+    """paare: [(quelle, ziel, modus)]. Schreibt erst ALLE Dateien als
+    <ziel>.neu (inkl. fsync, .py per compile() geprueft) und tauscht sie erst
+    dann per os.replace() aus. Frueher shutil.copy direkt ueber die laufenden
+    Dateien: brach das ab (volle SD-Karte), blieb eine halbe setup_portal.py
+    liegen - der Dienst startete danach nie wieder und konnte sich auch per
+    Selbst-Update nicht mehr reparieren. Bei einem Fehler bleiben die alten
+    Dateien unveraendert, die .neu-Dateien werden entfernt."""
+    neu = []
+    try:
+        for quelle, ziel, modus in paare:
+            tmp = ziel + ".neu"
+            shutil.copyfile(quelle, tmp)
+            neu.append((tmp, ziel))
+            os.chmod(tmp, modus)
+            with open(tmp, "rb") as f:
+                inhalt = f.read()
+                os.fsync(f.fileno())
+            if ziel.endswith(".py"):
+                compile(inhalt, ziel, "exec")
+        for tmp, ziel in neu:
+            os.replace(tmp, ziel)
+    except BaseException:
+        for tmp, _ in neu:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        raise
+
+
 def _self_update():
     """Aktualisiert das Portal selbst auf die neueste GitHub-Release-Version,
     OHNE ueber die generische App-Update-Engine (perform_update()) zu gehen -
@@ -2604,12 +2773,11 @@ def _self_update():
                 _write_self_update_state(True, False, "Unerwarteter Archivinhalt (GitHub-Tarball-Struktur hat sich geändert).")
                 return
             src_root = os.path.join(tmpdir, entries[0])
-            for name in SELF_UPDATE_FILES:
-                src = os.path.join(src_root, name)
-                if os.path.isfile(src):
-                    shutil.copy(src, os.path.join(PORTAL_DIR, name))
-            os.chmod(os.path.join(PORTAL_DIR, "setup-portal.sh"), 0o755)
-            os.chmod(os.path.join(PORTAL_DIR, "regen-issue.sh"), 0o755)
+            _dateien_atomar_ersetzen([
+                (os.path.join(src_root, name), os.path.join(PORTAL_DIR, name),
+                 0o755 if name.endswith(".sh") else 0o644)
+                for name in SELF_UPDATE_FILES if os.path.isfile(os.path.join(src_root, name))
+            ])
             # Mitgelieferte Hilfe-Bilder (Repo-Ordner hilfe-bilder/) nach
             # _shared kopieren; selbst abgelegte Bilder mit anderem Namen
             # bleiben unberuehrt.
@@ -2633,7 +2801,12 @@ def _self_update():
                     subprocess.run(["systemctl", "daemon-reload"], capture_output=True, text=True)
                 except OSError as e:
                     print(f"WARNUNG: .service-Datei konnte nicht aktualisiert werden: {e}", file=sys.stderr)
-    except (urllib.error.URLError, OSError, tarfile.TarError) as e:
+    except (urllib.error.URLError, OSError, tarfile.TarError, http.client.HTTPException,
+            EOFError, SyntaxError, ValueError) as e:
+        # HTTPException (z. B. IncompleteRead bei abgerissenem Download) und
+        # EOFError (abgeschnittenes Archiv) sind kein OSError - ohne sie endete
+        # der Prozess mit Traceback, ohne Ergebnis zu schreiben, und "Jetzt
+        # prüfen" drehte sich endlos.
         print(f"Update fehlgeschlagen: {e}", file=sys.stderr)
         _write_self_update_state(True, False, f"Update fehlgeschlagen: {e}")
         return
@@ -2842,15 +3015,20 @@ def _start_auto_install_sh(app):
         capture_output=True, text=True)
     if result.returncode != 0:
         _record_auto_install_result(app, False, "Komplett-Update konnte nicht gestartet werden: "
-                                    + (result.stderr or result.stdout or "").strip()[-300:])
+                                    + (result.stderr or result.stdout or "").strip()[-300:],
+                                    install_sh_lief=False)
 
 
-def _record_auto_install_result(app, ok, detail):
+def _record_auto_install_result(app, ok, detail, install_sh_lief=True):
     """Ergebnis des automatischen Komplett-Laufs fuer die Update-Seite merken.
-    Bei Fehlschlag wird die Automatik fuer diese App abgeschaltet, damit ein
-    kaputtes install.sh nicht jede Nacht erneut versucht wird - der Button
-    "Komplett von GitHub aktualisieren" bleibt als manueller Weg."""
-    if not ok:
+    Ist install.sh selbst fehlgeschlagen, wird die Automatik fuer diese App
+    abgeschaltet, damit ein kaputtes install.sh nicht jede Nacht erneut
+    versucht wird - der Button "Komplett von GitHub aktualisieren" bleibt als
+    manueller Weg. Lief install.sh gar nicht (GitHub-Abfragelimit, Netz weg,
+    Download abgerissen), bleibt die Automatik an und es wird beim naechsten
+    Check erneut versucht - frueher schaltete schon ein kurzer Netzfehler sie
+    dauerhaft ab."""
+    if not ok and install_sh_lief:
         set_auto_install_sh(app["id"], False)
     state = read_update_check_state(app)
     state["auto_install"] = {"ok": ok, "detail": detail, "at": time.strftime("%Y-%m-%d %H:%M")}
@@ -2878,16 +3056,18 @@ def run_auto_install_sh(app):
 
 
 def _run_auto_install_sh_locked(app):
+    install_sh_lief = False
     try:
         ok, detail, install_sh_hash = _download_and_run_install_script(
             app["update"]["github_repo"], app.get("install_script_path", "setup/install.sh"), app["label"])
+        install_sh_lief = install_sh_hash is not None
         if ok and install_sh_hash:
             _write_installed_install_sh_hash(app["id"], install_sh_hash)
     except subprocess.TimeoutExpired:
-        ok, detail = False, "Ausführung hat zu lange gedauert (Timeout)."
+        ok, detail, install_sh_lief = False, "Ausführung hat zu lange gedauert (Timeout).", True
     except Exception as e:
         ok, detail = False, f"Unerwarteter Fehler: {e}"
-    _record_auto_install_result(app, ok, detail)
+    _record_auto_install_result(app, ok, detail, install_sh_lief)
     print(detail, file=sys.stderr)
 
 
@@ -2922,6 +3102,7 @@ def perform_update(app, tarball_url, target_tag, progress=None):
 
     def _restart_services():
         _step("Dienste werden wieder gestartet…")
+        markiere_auto_neustart(services)
         for svc in services:
             subprocess.run(["systemctl", "start", svc], capture_output=True, text=True)
 
@@ -2946,9 +3127,22 @@ def perform_update(app, tarball_url, target_tag, progress=None):
                 if entry.get("mode") == "dir":
                     if not os.path.isdir(src):
                         continue
+                    # Erst komplett daneben kopieren, dann tauschen: frueher
+                    # rmtree + copytree - brach das Kopieren ab (volle Karte),
+                    # fehlte der Ordner (z. B. static/) danach teilweise.
+                    neu, alt = dest + ".neu", dest + ".alt"
+                    for rest in (neu, alt):
+                        if os.path.isdir(rest):
+                            shutil.rmtree(rest)
+                    try:
+                        shutil.copytree(src, neu)
+                    except OSError:
+                        shutil.rmtree(neu, ignore_errors=True)
+                        raise
                     if os.path.isdir(dest):
-                        shutil.rmtree(dest)
-                    shutil.copytree(src, dest)
+                        os.rename(dest, alt)
+                    os.rename(neu, dest)
+                    shutil.rmtree(alt, ignore_errors=True)
                 else:
                     if not os.path.isfile(src):
                         continue
@@ -3121,14 +3315,21 @@ def _download_and_run_install_script(github_repo, install_script_path, label, re
     if not release or not release.get("tarball_url"):
         return False, github_limit_text() or "Neueste Version konnte nicht ermittelt werden.", None
     req = urllib.request.Request(release["tarball_url"], headers={"User-Agent": "Pi-Setup-Install-Run"})
+    # Netz-/Downloadfehler (auch ein abgerissener Download: IncompleteRead ist
+    # kein OSError) als normales Ergebnis ohne Hash zurueckgeben - der
+    # Aufrufer unterscheidet daran "install.sh lief nicht" von "install.sh
+    # ist fehlgeschlagen" (siehe _run_auto_install_sh_locked()).
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:
             archive_data = resp.read()
-    except urllib.error.HTTPError as e:
+    except (urllib.error.URLError, OSError, http.client.HTTPException) as e:
         return False, f"Herunterladen fehlgeschlagen: {_github_fehlertext(e)}", None
     with tempfile.TemporaryDirectory() as tmpdir:
-        with tarfile.open(fileobj=io.BytesIO(archive_data), mode="r:gz") as tar:
-            tar.extractall(path=tmpdir, filter="data")
+        try:
+            with tarfile.open(fileobj=io.BytesIO(archive_data), mode="r:gz") as tar:
+                tar.extractall(path=tmpdir, filter="data")
+        except (tarfile.TarError, EOFError, OSError) as e:
+            return False, f"Heruntergeladenes Archiv ist unvollständig oder beschädigt: {e}", None
         entries = os.listdir(tmpdir)
         if len(entries) != 1:
             return False, "Unerwarteter Archivinhalt (GitHub-Tarball-Struktur hat sich geaendert).", None
@@ -3142,11 +3343,15 @@ def _download_and_run_install_script(github_repo, install_script_path, label, re
         # usw.) - grosszuegiges Timeout, damit ein echter Haenger trotzdem
         # irgendwann als Fehler zurueckkommt statt den Thread fuer immer zu
         # blockieren.
+        markiere_auto_neustart(["alle"])
         result = subprocess.run(["bash", script], cwd=src_root, capture_output=True, text=True, timeout=1800)
+        markiere_auto_neustart(["alle"])
         if result.returncode == 0:
             return True, f"{label}: install.sh wurde erfolgreich ausgefuehrt.", script_hash
         fehlerausgabe = (result.stderr or result.stdout or "").strip()[-800:]
-        return False, f"install.sh fehlgeschlagen (Exit-Code {result.returncode}): {fehlerausgabe}", None
+        # Hash auch bei Fehlschlag: zeigt dem Aufrufer, dass install.sh selbst
+        # lief (geschrieben wird er nur bei Erfolg, siehe "ok and hash").
+        return False, f"install.sh fehlgeschlagen (Exit-Code {result.returncode}): {fehlerausgabe}", script_hash
 
 
 def _run_companion_install_in_background(companion):
@@ -3397,7 +3602,7 @@ LAST_RESULT_SHOW_S = 24 * 3600
 LONG_RUNNING_HINT = ("Das dauert ungewöhnlich lange. Falls sich nichts mehr tut, hängt vermutlich "
                      "etwas - ein Neustart des Geräts beendet den Vorgang und gibt alles wieder frei.")
 
-REBOOT_BUTTON = """<form method="post" action="/system/reboot" onsubmit="return confirm('Pi jetzt neu starten? Der laufende Vorgang wird dabei abgebrochen.');">
+REBOOT_BUTTON = """<form method="post" action="/system/reboot?force=1" onsubmit="return confirm('Pi jetzt neu starten? Der laufende Vorgang wird dabei abgebrochen.');">
   <button type="submit" class="btn-danger btn-small">🔄 Pi neu starten</button>
 </form>"""
 
@@ -3573,7 +3778,7 @@ def render_landing(request_host=None):
         companion_section=companion_section,
         wifi_link='<a class="btn" href="/wifi">📶 WLAN-Einstellungen</a>\n' if IS_PI else "",
         ip_lines=ip_lines,
-        system_buttons=SYSTEM_BUTTONS if IS_PI else "",
+        system_buttons=render_system_buttons() if IS_PI else "",
         donate_section=donate_section,
         stats_line=render_stats_line(apps),
     )
@@ -3687,21 +3892,33 @@ class BaseHandler(BaseHTTPRequestHandler):
     def handle_system_action(self):
         """True, wenn der Pfad eine System-Aktion war (Reboot/Shutdown).
         Nur auf einem echten Pi erreichbar."""
-        if self.path not in ("/system/reboot", "/system/shutdown"):
+        pfad, _, query = self.path.partition("?")
+        if pfad not in ("/system/reboot", "/system/shutdown"):
             return False
         if not IS_PI:
             self._not_found()
             return True
-        if self.path == "/system/reboot":
+        # Laeuft gerade ein Update/install.sh (z. B. von einem anderen Geraet
+        # oder dem Nacht-Timer gestartet), nicht ohne ausdrueckliche
+        # Bestaetigung neu starten - ein Abbruch mitten im Kopieren hinterlaesst
+        # eine halb aktualisierte App. Der Haenger-Knopf auf /update sendet force=1.
+        laeuft = update_lock_holder()
+        if laeuft and "force=1" not in query.split("&"):
+            aktion = "neu starten" if pfad == "/system/reboot" else "herunterfahren"
+            self._send_html(PAGE_SYSTEM_ACTION_BESTAETIGEN.format(
+                header=render_header(), laeuft=html.escape(laeuft), aktion=aktion, pfad=pfad))
+            return True
+        if pfad == "/system/reboot":
             self._send_html(PAGE_SYSTEM_ACTION.format(
                 action="Neustart", verb="startet neu",
                 hint="Diese Seite versucht in Kürze automatisch, sich neu zu verbinden, "
                      "und lädt sich dann selbst neu.",
                 retry_script=RETRY_SCRIPT,
             ))
+            markiere_auto_neustart(["reboot"])
             threading.Thread(target=_delayed_system_call, args=(["systemctl", "reboot"],), daemon=True).start()
             return True
-        if self.path == "/system/shutdown":
+        if pfad == "/system/shutdown":
             self._send_html(PAGE_SYSTEM_ACTION.format(
                 action="Herunterfahren", verb="fährt herunter",
                 hint="Der Pi muss danach manuell wieder eingeschaltet werden "
@@ -3714,6 +3931,10 @@ class BaseHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = self.path.split("?", 1)[0]
+        # Backups enthalten Zugangsdaten (Tokens) - nicht ueber fremde Hostnamen
+        # (DNS-Rebinding) ausliefern.
+        if path.startswith("/backup/download") and self._anfrage_abgelehnt(schreibend=False):
+            return
         if path == "/tipps":
             self._send_html(PAGE_TIPPS.format(header=render_header()))
             return
@@ -3810,7 +4031,24 @@ class BaseHandler(BaseHTTPRequestHandler):
             return
         self._send_html(render_landing(self.headers.get("Host")))
 
+    def _anfrage_abgelehnt(self, schreibend):
+        """403 statt Ausfuehrung bei fremdem Host (DNS-Rebinding) bzw. bei
+        einem POST von einer fremden Seite (CSRF). True = abgelehnt."""
+        host = self.headers.get("Host")
+        if not _host_erlaubt(host):
+            grund = (f"Unbekannter Hostname „{html.escape(host or '')}“. Bitte das Portal über die IP-Adresse "
+                     f"oder den .local-Namen öffnen (weitere Namen: SETUP_PORTAL_ERLAUBTE_HOSTS in "
+                     f"/etc/default/setup-portal).")
+        elif schreibend and not _herkunft_passt(self.headers.get("Origin"), self.headers.get("Referer"), host):
+            grund = "Diese Aktion wurde von einer fremden Seite ausgelöst und deshalb nicht ausgeführt."
+        else:
+            return False
+        self._send_html(f'<!DOCTYPE html><meta charset="utf-8"><p>{grund}</p>', status=403)
+        return True
+
     def do_POST(self):
+        if self._anfrage_abgelehnt(schreibend=True):
+            return
         if self.handle_system_action():
             return
         path = self.path.split("?", 1)[0]
@@ -3870,13 +4108,22 @@ class BaseHandler(BaseHTTPRequestHandler):
                 return
             content_type = self.headers.get("Content-Type", "")
             length = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(length)
-            filename, data = parse_multipart_file(body, content_type)
-            if not filename or not data:
-                self._send_html(render_restore_page(
-                    app, '<div class="msg err">Keine Datei hochgeladen oder Datei nicht lesbar.</div>'))
-                return
-            ok, detail = self._restore_locked(app, restore_backup_from_bytes, app, data, filename)
+            with tempfile.TemporaryDirectory(dir=UPLOAD_TMP_DIR, prefix="setup-portal-upload-") as tmpdir:
+                roh, archiv = os.path.join(tmpdir, "upload"), os.path.join(tmpdir, "backup.tar.gz")
+                try:
+                    with open(roh, "wb") as f:
+                        upload_in_datei_lesen(self.rfile, length, f)
+                    filename = parse_multipart_datei(roh, content_type, archiv)
+                    os.remove(roh)
+                except OSError as e:
+                    self._send_html(render_restore_page(
+                        app, f'<div class="msg err">Upload konnte nicht gespeichert werden: {html.escape(str(e))}</div>'))
+                    return
+                if not filename:
+                    self._send_html(render_restore_page(
+                        app, '<div class="msg err">Keine Datei hochgeladen oder Datei nicht lesbar.</div>'))
+                    return
+                ok, detail = self._restore_locked(app, restore_backup_from_file, app, archiv, filename)
             msg = (f'<div class="msg ok">✅ {detail}</div>' if ok else f'<div class="msg err">{detail}</div>')
             self._send_html(render_restore_page(app, msg))
             return
@@ -4017,7 +4264,7 @@ class BaseHandler(BaseHTTPRequestHandler):
                     self.headers.get("Host"), '<div class="msg err">Bitte eine SSID auswaehlen oder eingeben.</div>'))
                 return
             CONN_STATE.update(done=False, ok=None, detail=None)
-            self._send_html(PAGE_CONNECTING.format(ssid=ssid))
+            self._send_html(PAGE_CONNECTING.format(ssid=html.escape(ssid)))
             ok, detail = connect_wifi(ssid, password)
             CONN_STATE.update(done=True, ok=ok, detail=None if ok else detail)
             if ok:
