@@ -123,7 +123,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote
 
-PORTAL_VERSION = "1.8.20"
+PORTAL_VERSION = "1.8.21"
 
 PORTAL_DIR = "/opt/setup-portal"
 # Jede App legt hier per eigenem install.sh genau eine Datei <app-id>.json
@@ -441,6 +441,7 @@ STYLE = """
   .pill-ok {{ background: var(--msg-ok-bg); }}
   .pill-warn {{ background: var(--msg-warn-bg); }}
   .pill-err {{ background: var(--msg-err-bg); }}
+  .pill-stale {{ background: transparent; color: var(--muted); border: 1px solid var(--muted); font-weight: normal; }}
   .btn-quiet {{ background: transparent; color: var(--fg); border: 1px solid var(--muted); font-weight: normal; }}
   .btn-quiet:active {{ background: var(--input-border); }}
   details.notes, details.more {{ margin-top: .9rem; }}
@@ -2430,6 +2431,28 @@ def _github_fehlertext(e):
     return str(e)
 
 
+def _github_alter_stand(url):
+    """Zeitpunkt der zwischengespeicherten Antwort, wenn sie nur noch
+    ersatzweise genutzt wird (aelter als GITHUB_CACHE_TTL_S, weil die
+    erneute Abfrage scheiterte - Limit/offline), sonst None. Damit die
+    Karte dann nicht gruen "aktuell" zeigt, obwohl inzwischen ein neueres
+    Release erschienen sein kann (2026-10-10: "v2.9.46 aktuell" waehrend
+    der Sperre, obwohl v2.9.47 schon draussen war)."""
+    with _github_cache_lock:
+        eintrag = _github_cache.get(url)
+    if eintrag and time.time() - eintrag[0] >= GITHUB_CACHE_TTL_S:
+        return eintrag[0]
+    return None
+
+
+def _stand_pill(text, stand):
+    """'aktuell' bzw. sonstiger Status - bei nur ersatzweise genutztem
+    GitHub-Stand grau mit Uhrzeit statt gruen."""
+    if stand:
+        return _version_pill(f"{text} (Stand {time.strftime('%H:%M', time.localtime(stand))})", "stale")
+    return _version_pill(text, "ok")
+
+
 def _github_cache_leeren():
     with _github_cache_lock:
         _github_cache.clear()
@@ -2660,9 +2683,21 @@ def fetch_latest_release(app):
     return _fetch_latest_release_for_repo(app["update"]["github_repo"])
 
 
+def _releases_url(app, limit=10):
+    return f"https://api.github.com/repos/{app['update']['github_repo']}/releases?per_page={limit}"
+
+
+def neuestes_release(releases):
+    """Wie GitHubs releases/latest (neuestes, kein Pre-Release), aber aus
+    der ohnehin abgefragten Liste - spart auf der Update-Seite eine
+    API-Abfrage pro App (ohne Anmeldung nur 60 pro Stunde fuer alle Geraete
+    am Anschluss zusammen)."""
+    kandidaten = [r for r in releases if not r.get("prerelease")]
+    return max(kandidaten, key=lambda r: parse_version(r["tag"])) if kandidaten else None
+
+
 def fetch_all_releases(app, limit=10):
-    repo = app["update"]["github_repo"]
-    data = _github_get(f"https://api.github.com/repos/{repo}/releases?per_page={limit}")
+    data = _github_get(_releases_url(app, limit))
     if not isinstance(data, list):
         return []
     try:
@@ -3171,8 +3206,9 @@ def render_update_card(app):
     render_update_overview() baut daraus die Zusammenfassung oben."""
     app_id = app["id"]
     current = app_version(app)
-    release = fetch_latest_release(app)
     all_releases = fetch_all_releases(app)
+    release = neuestes_release(all_releases)
+    stand = _github_alter_stand(_releases_url(app))
     auto_update_on = get_auto_update(app_id)
     auto_install_sh_on = get_auto_install_sh(app_id)
     update_tag = None
@@ -3225,7 +3261,7 @@ def render_update_card(app):
                     + '</div>'
                     f'<button type="button" onclick="return startInstallRun(\'{app_id}\')">🔄 Setup jetzt nachholen</button>')
             else:
-                pill = _version_pill("aktuell", "ok")
+                pill = _stand_pill("aktuell", stand)
 
     last_auto_install = read_update_check_state(app).get("auto_install") or {}
     if last_auto_install.get("detail") and not last_auto_install.get("ok"):
@@ -3321,12 +3357,17 @@ def render_self_update_card():
                   f'{html.escape(release["tag"])} aktualisieren</button>')
     else:
         pill_kind = "ok"
-        pill = _version_pill("aktuell", "ok")
+        pill = _stand_pill("aktuell", _github_alter_stand(
+            f"https://api.github.com/repos/{SELF_UPDATE_GITHUB_REPO}/releases/latest"))
     state = read_self_update_check_state()
     status_line = ""
     # Nur solange noch etwas aussteht - ist das Portal aktuell, ist ein alter
     # Fehlschlag/Aufschub erledigt. Gelb statt rot: meist nur "aufgeschoben".
-    if pill_kind != "ok" and state.get("done") and state.get("detail") and not state.get("ok"):
+    # Bei angezeigter Sperre nicht noch einmal dasselbe als "Letzte Pruefung"
+    # (stand doppelt da, wenn "Jetzt pruefen" in die Sperre lief).
+    limit_angezeigt = release is None and github_limit_bis()
+    if (pill_kind != "ok" and not limit_angezeigt and state.get("done") and state.get("detail")
+            and not state.get("ok")):
         when = f' ({html.escape(state["at"])})' if state.get("at") else ""
         status_line = f'<div class="msg warn small">ℹ️ Letzte Prüfung{when}: {html.escape(state["detail"])}</div>'
     return f"""
