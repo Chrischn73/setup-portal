@@ -126,7 +126,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
-PORTAL_VERSION = "1.8.23"
+PORTAL_VERSION = "1.8.24"
 
 PORTAL_DIR = "/opt/setup-portal"
 # Jede App legt hier per eigenem install.sh genau eine Datei <app-id>.json
@@ -174,17 +174,68 @@ UPDATE_STATE = {}
 # hat - genau dann muss das Polling trotzdem funktionieren.
 COMPANION_INSTALL_STATE = {}
 
+# Die Apps, die das Portal von sich aus zum Installieren anbietet - gleiches
+# Format wie das "companion"-Feld im Descriptor. Ausnahme von der Regel
+# "das Portal kennt keine App": ist noch GAR KEINE App registriert, gibt es
+# keinen Descriptor, aus dem ein companion-Feld kommen koennte, und die
+# Startseite haette keinen einzigen Installieren-Knopf (Nutzer 2026-10-11:
+# "so kann man ja nichts mit dem Portal anfangen"). Deklariert eine
+# registrierte App dieselbe app_id als companion, gilt deren Eintrag.
+BEKANNTE_APPS = [
+    {
+        "app_id": "honigbox",
+        "label": "BeeTown HonigBox",
+        "emoji": "🍯",
+        "github_repo": "Chrischn73/honigbox",
+        "beschreibung": ("Überwacht die Tür einer Honig-Verkaufsbox per Kontaktschalter, macht bei jeder "
+                         "Öffnung automatisch Fotos und schickt eine Push-Benachrichtigung ans Handy. "
+                         "Läuft direkt auf einem Raspberry Pi in der Box."),
+        "warnung_ohne_pi": ("Die HonigBox wurde für einen Raspberry Pi entwickelt und benötigt eine kleine "
+                            "Kamera (Pi-Kamera oder USB-Kamera) sowie einen Türkontakt-Schalter. Dieses "
+                            "System ist kein Raspberry Pi – die Installation ist hier in der Regel nicht sinnvoll."),
+    },
+    {
+        "app_id": "imkerei",
+        "label": "BeeTown Imker-App",
+        "emoji": "🐝",
+        "github_repo": "Chrischn73/beetown",
+        "beschreibung": ("App für die Imkerei-Verwaltung: Bienenstände, Rühr-Vorgänge und Honigverkauf "
+                         "erfassen und dokumentieren."),
+    },
+]
+
 
 def _companion_install_state(app_id):
     return COMPANION_INSTALL_STATE.setdefault(app_id, {"done": True, "ok": None, "detail": None})
 
 
+def installierbare_apps(apps=None):
+    """Alle Apps, die hier noch NICHT registriert sind und installiert werden
+    koennen: BEKANNTE_APPS plus die companion-Felder der registrierten Apps
+    (letztere gewinnen bei gleicher app_id). Reihenfolge wie BEKANNTE_APPS."""
+    if apps is None:
+        apps = load_apps()
+    kandidaten = {c["app_id"]: c for c in BEKANNTE_APPS}
+    for app in apps:
+        if app.get("companion"):
+            kandidaten[app["companion"]["app_id"]] = app["companion"]
+    installed_ids = {a["id"] for a in apps}
+    return [c for app_id, c in kandidaten.items() if app_id not in installed_ids]
+
+
+def installierbare_app(app_id):
+    return next((c for c in installierbare_apps() if c["app_id"] == app_id), None)
+
+
 def _known_companion_ids():
-    """Alle App-IDs, die IRGENDEINE aktuell registrierte App als 'companion'
-    deklariert - Whitelist fuer GET /companion/install/status/<id>, damit
-    dort nicht beliebige Pfade COMPANION_INSTALL_STATE unbegrenzt wachsen
-    lassen koennen (gleiches Muster wie bei GET /update/status/<id>)."""
-    return {app["companion"]["app_id"] for app in load_apps() if app.get("companion")}
+    """Alle App-IDs, die installiert werden KOENNEN (BEKANNTE_APPS + die
+    'companion'-Felder registrierter Apps) - Whitelist fuer GET
+    /companion/install/status/<id>, damit dort nicht beliebige Pfade
+    COMPANION_INSTALL_STATE unbegrenzt wachsen lassen koennen (gleiches
+    Muster wie bei GET /update/status/<id>). Bewusst inkl. schon
+    installierter: das Polling laeuft nach dem Ende der Installation weiter."""
+    return ({c["app_id"] for c in BEKANNTE_APPS}
+            | {app["companion"]["app_id"] for app in load_apps() if app.get("companion")})
 
 
 def _update_state(app_id):
@@ -544,20 +595,45 @@ PAGE_LANDING = """<!doctype html>
 {system_buttons}
 {donate_section}
 
-<div id="companion-install-modal" class="modal-backdrop">
+<div id="companion-install-modal" class="modal-backdrop" data-adressen="{portal_adressen}">
   <div class="modal-box" id="companion-install-modal-content"></div>
 </div>
 <script>
-function companionInstallPoll(appId, content) {{
+// install.sh startet einen frischen Pi am Ende neu (Hostname-Umbenennung).
+// Danach ist der Status im Portal leer ({{done: true, ok: null}}), die App aber
+// registriert ('installed') - das ist dann Erfolg, kein Abbruch.
+var companionInstallFehler = 0;
+function companionInstallPoll(appId, label, content) {{
   fetch('/companion/install/status/' + appId).then(r => r.json()).then(function(d) {{
-    if (!d.done) {{ setTimeout(function() {{ companionInstallPoll(appId, content); }}, 3000); return; }}
-    content.innerHTML = d.ok
-      ? '<div class="msg ok">✅ ' + d.detail + '</div>'
-      : '<div class="msg err">❌ ' + (d.detail || 'Installation abgebrochen.') + '</div>';
+    var neustart = companionInstallFehler >= 3;
+    companionInstallFehler = 0;
+    if (!d.done) {{ setTimeout(function() {{ companionInstallPoll(appId, label, content); }}, 3000); return; }}
+    if (d.ok) {{
+      content.innerHTML = '<div class="msg ok">✅ ' + d.detail + '</div>';
+    }} else if (d.ok === null && d.installed) {{
+      content.innerHTML = '<div class="msg ok">✅ ' + label + ' wurde installiert' +
+        (neustart ? ', das Gerät wurde dabei neu gestartet.' : '.') + '</div>';
+    }} else {{
+      content.innerHTML = '<div class="msg err">❌ ' + (d.detail || 'Installation abgebrochen.') + '</div>';
+    }}
     setTimeout(function() {{ window.location.reload(); }}, 3000);
-  }}).catch(function() {{ setTimeout(function() {{ companionInstallPoll(appId, content); }}, 3000); }});
+  }}).catch(function() {{
+    companionInstallFehler++;
+    if (companionInstallFehler === 3) {{
+      var adressen = JSON.parse(document.getElementById('companion-install-modal').dataset.adressen || '[]');
+      var links = adressen.map(function(a) {{ return '<a href="' + a + '">' + a + '</a>'; }}).join(' oder ');
+      var hinweis = document.getElementById('companion-install-neustart');
+      if (hinweis) {{
+        hinweis.innerHTML = '🔄 Das Gerät startet gerade neu (dauert etwa 1–2 Minuten). ' +
+          'Die Seite meldet sich danach von selbst.' +
+          (links ? ' Falls nicht, das Portal über die IP-Adresse aufrufen: ' + links : '');
+        hinweis.style.display = 'block';
+      }}
+    }}
+    setTimeout(function() {{ companionInstallPoll(appId, label, content); }}, 3000);
+  }});
 }}
-function startCompanionInstall(hostAppId, companionAppId, companionLabel, warning) {{
+function startCompanionInstall(companionAppId, companionLabel, warning) {{
   var question = companionLabel + ' jetzt automatisch von GitHub herunterladen und installieren?';
   if (warning) {{
     question = '⚠️ Achtung\\n\\n' + warning + '\\n\\n' + companionLabel + ' trotzdem von GitHub herunterladen und installieren?';
@@ -569,16 +645,17 @@ function startCompanionInstall(hostAppId, companionAppId, companionLabel, warnin
   var content = document.getElementById('companion-install-modal-content');
   content.innerHTML = '<h1>""" + SPINNER_SVG + """Installiere ' + companionLabel + '…</h1>' +
     '<p class="muted">Neueste Version wird von GitHub geladen und eingerichtet. ' +
-    'Das kann einige Minuten dauern – bitte die Seite nicht schließen.</p>';
+    'Das kann einige Minuten dauern – bitte die Seite nicht schließen.</p>' +
+    '<p class="msg warn small" id="companion-install-neustart" style="display:none;"></p>';
   modal.classList.add('show');
-  fetch('/companion/install/' + hostAppId, {{method: 'POST'}}).then(r => r.json()).then(function(d) {{
+  fetch('/app/install/' + companionAppId, {{method: 'POST'}}).then(r => r.json()).then(function(d) {{
     if (!d.started) {{
       content.innerHTML = '<div class="msg err">❌ ' + (d.error || 'Konnte nicht gestartet werden.') + '</div>' +
         '<button type="button" onclick="window.location.reload()">OK</button>';
       return;
     }}
-    companionInstallPoll(companionAppId, content);
-  }}).catch(function() {{ companionInstallPoll(companionAppId, content); }});
+    companionInstallPoll(companionAppId, companionLabel, content);
+  }}).catch(function() {{ companionInstallPoll(companionAppId, companionLabel, content); }});
   return false;
 }}
 </script>
@@ -2074,7 +2151,8 @@ def render_backup_overview(message="", skip_remount=False):
     apps = load_apps()
 
     if not apps:
-        app_sections = '<p class="muted">Keine Anwendung registriert.</p>'
+        app_sections = ('<p class="muted">Noch keine Anwendung installiert – '
+                        '<a href="/">auf der Startseite installieren</a>.</p>')
         all_backup_button = ""
     else:
         sections = []
@@ -3654,7 +3732,8 @@ def render_update_overview(message=""):
     apps = load_apps()
     summary = ""
     if not apps:
-        app_sections = '<p class="muted">Keine Anwendung registriert.</p>'
+        app_sections = ('<p class="muted">Noch keine Anwendung installiert – '
+                        '<a href="/">auf der Startseite installieren</a>.</p>')
     else:
         cards = [(app, *render_update_card(app)) for app in apps]
         app_sections = "".join(card for _app, card, _tag in cards)
@@ -3693,7 +3772,8 @@ def render_landing(request_host=None):
     apps = load_apps()
 
     if not apps:
-        app_cards = '<p class="muted" style="text-align:center;">Keine Anwendung registriert.</p>'
+        app_cards = ('<p class="muted" style="text-align:center;">Noch keine Anwendung installiert – '
+                     'bitte unten auswählen.</p>')
         donate_section = ""
     else:
         parts = []
@@ -3720,18 +3800,13 @@ def render_landing(request_host=None):
         app_cards = "".join(parts)
         donate_section = "".join(donate_parts)
 
-    # Fuer jede installierte App mit "companion"-Feld, deren Partner-App
-    # NOCH NICHT registriert ist (kein eigener apps.d/-Eintrag) - Button
-    # startet den Download+install.sh-Lauf, siehe _run_companion_install_
-    # in_background(). Sind beide Apps schon installiert, deklariert also
-    # z.B. sowohl HonigBox als auch BeeTown den anderen als companion,
-    # verschwinden hier automatisch beide Karten.
-    installed_ids = {a["id"] for a in apps}
+    # Fuer jede noch NICHT registrierte App (BEKANNTE_APPS + companion-Felder
+    # der registrierten Apps, siehe installierbare_apps()) - Button startet
+    # den Download+install.sh-Lauf, siehe _run_companion_install_in_
+    # background(). Sind beide Apps schon installiert, verschwinden hier
+    # automatisch beide Karten.
     companion_parts = []
-    for app in apps:
-        comp = app.get("companion")
-        if not comp or comp["app_id"] in installed_ids:
-            continue
+    for comp in installierbare_apps(apps):
         beschreibung_block = (
             f'<p class="muted" style="font-size:.85rem; margin:.4rem 0 0;">{html.escape(comp["beschreibung"])}</p>'
             if comp.get("beschreibung") else ""
@@ -3743,10 +3818,12 @@ def render_landing(request_host=None):
         companion_parts.append(
             '<div class="msg" style="text-align:center;">'
             f'<p>{comp.get("emoji", "⬇️")} <strong>{html.escape(comp["label"])}</strong> '
-            'ist auf diesem Pi noch nicht installiert.</p>'
+            f'ist auf diesem {"Pi" if IS_PI else "Gerät"} noch nicht installiert.</p>'
             f'{beschreibung_block}'
-            f'<button class="btn btn-small" style="margin-top:.6rem;" onclick="return startCompanionInstall(\'{app["id"]}\', '
-            f'\'{comp["app_id"]}\', \'{comp["label"]}\', {warnung_js})">⚙️ {html.escape(comp["label"])} installieren</button>'
+            f'<button class="btn btn-small" style="margin-top:.6rem;" onclick="return startCompanionInstall('
+            f'{html.escape(json.dumps(comp["app_id"]), quote=True)}, '
+            f'{html.escape(json.dumps(comp["label"]), quote=True)}, {warnung_js})">'
+            f'⚙️ {html.escape(comp["label"])} installieren</button>'
             '</div>'
         )
     companion_section = "".join(companion_parts)
@@ -3764,9 +3841,16 @@ def render_landing(request_host=None):
     if IS_PI:
         ip_lines = (f'Kabel (eth0): {get_ip("eth0") or "nicht verbunden"}<br>'
                     f'WLAN (wlan0): {get_ip("wlan0") or "nicht verbunden"}')
+        adressen = [a for a in (get_ip("eth0"), get_ip("wlan0")) if a]
     else:
         ips = all_ips()
         ip_lines = "<br>".join(f"{iface}: {addr}" for iface, addr in ips) if ips else "nicht verbunden"
+        adressen = [addr for _, addr in ips]
+    # Fuer den Hinweis im Installations-Fenster: install.sh benennt einen
+    # frischen Pi ("raspberrypi") um und startet ihn neu - wer das Portal
+    # ueber raspberrypi.local aufgerufen hat, kommt danach nur noch per IP an.
+    port = "" if PORT_LANDING == 80 else f":{PORT_LANDING}"
+    portal_adressen = html.escape(json.dumps([f"http://{a}{port}/" for a in adressen]), quote=True)
 
     title = _landing_title()
     return PAGE_LANDING.format(
@@ -3781,6 +3865,7 @@ def render_landing(request_host=None):
         system_buttons=render_system_buttons() if IS_PI else "",
         donate_section=donate_section,
         stats_line=render_stats_line(apps),
+        portal_adressen=portal_adressen,
     )
 
 
@@ -4007,7 +4092,9 @@ class BaseHandler(BaseHTTPRequestHandler):
             if comp_id not in _known_companion_ids():
                 self._send_json({"done": True, "ok": None, "detail": None})
                 return
-            self._send_json(_companion_install_state(comp_id))
+            # 'installed': nach einem Neustart durch install.sh ist der
+            # (fluechtige) Status leer - dann entscheidet das, ob es geklappt hat.
+            self._send_json({**_companion_install_state(comp_id), "installed": bool(get_app(comp_id))})
             return
         if path in ("/wifi", "/wifi/status", "/wifi/networks") and not IS_PI:
             self._not_found()
@@ -4055,7 +4142,7 @@ class BaseHandler(BaseHTTPRequestHandler):
         # Vor einer Update-Aktion frisch von GitHub holen statt aus dem
         # Zwischenspeicher - sonst liefe z. B. "Setup nachholen" kurz nach
         # einem neuen Release noch mit dem alten install.sh.
-        if re.match(r"^/(update/(run|run-install|switch)/[^/]+|update/run-all|companion/install/[^/]+)$", path):
+        if re.match(r"^/(update/(run|run-install|switch)/[^/]+|update/run-all|(app|companion)/install/[^/]+)$", path):
             _github_cache_leeren()
 
         m = re.match(r"^/backup/create/([^/]+)$", path)
@@ -4178,10 +4265,24 @@ class BaseHandler(BaseHTTPRequestHandler):
             self._start_update_job(app["id"], f"Komplett-Lauf (install.sh) {app['label']}",
                                    _run_install_script_in_background, app)
             return
-        m = re.match(r"^/companion/install/([^/]+)$", path)
+        # /app/install/<app-id>: Ziel-App direkt (BEKANNTE_APPS/companion,
+        # funktioniert auch ohne jede registrierte App). /companion/install/
+        # <host-id> ist die alte Form (companion der registrierten App
+        # <host-id>) - bleibt fuer noch offene Seiten von vor dem
+        # Self-Update erhalten.
+        m = re.match(r"^/(app|companion)/install/([^/]+)$", path)
         if m:
-            host_app = get_app(unquote(m.group(1)))
-            companion = host_app.get("companion") if host_app else None
+            if m.group(1) == "app":
+                comp_id = unquote(m.group(2))
+                installiert = get_app(comp_id)
+                if installiert:
+                    self._send_json({"started": False,
+                                     "error": f"{installiert['label']} ist bereits installiert."})
+                    return
+                companion = installierbare_app(comp_id)
+            else:
+                host_app = get_app(unquote(m.group(2)))
+                companion = host_app.get("companion") if host_app else None
             if not companion:
                 self._not_found()
                 return

@@ -2,7 +2,7 @@
 
 Gemeinsame, App-unabhängige Setup-Seite für Raspberry-Pi-Projekte: WLAN-Einrichtung, tägliches Backup (inkl. USB-Stick), Selbst-Update über GitHub-Releases, Hilfe-Seiten (Handy-Tipps, VPN per Fritzbox+WireGuard). Läuft dauerhaft auf Port 80 (Ausweich-Port, falls belegt).
 
-Dieses Portal kennt selbst **keine** Anwendung namentlich – jede App registriert sich zur Laufzeit mit einer kleinen JSON-Beschreibung unter `/opt/setup-portal/apps.d/<app-id>.json` (Pfade, Ports, Backup-/Restore-Konfiguration, Update-Quelle). Aktuell nutzen [HonigBox](https://github.com/Chrischn73/honigbox) und [BeeTown](https://github.com/Chrischn73/beetown) dieses Portal gemeinsam auf demselben Pi – die Landing-Page zeigt dann einen Button pro installierter App.
+Dieses Portal enthält keine app-spezifische Logik – jede App registriert sich zur Laufzeit mit einer kleinen JSON-Beschreibung unter `/opt/setup-portal/apps.d/<app-id>.json` (Pfade, Ports, Backup-/Restore-Konfiguration, Update-Quelle). Aktuell nutzen [HonigBox](https://github.com/Chrischn73/honigbox) und [BeeTown](https://github.com/Chrischn73/beetown) dieses Portal gemeinsam auf demselben Pi – die Landing-Page zeigt dann einen Button pro installierter App. Ist noch keine App installiert (Portal allein auf einem frischen Pi), bietet die Landing-Page beide zum Installieren an (`BEKANNTE_APPS` in `setup_portal.py`: Download des neuesten Releases, dann dessen `setup/install.sh`).
 
 ## Nutzung
 
