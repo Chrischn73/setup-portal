@@ -126,7 +126,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
-PORTAL_VERSION = "1.8.26"
+PORTAL_VERSION = "1.8.27"
 
 PORTAL_DIR = "/opt/setup-portal"
 # Jede App legt hier per eigenem install.sh genau eine Datei <app-id>.json
@@ -532,6 +532,8 @@ STYLE = """
   .modal-box {{ background: var(--bg); color: var(--fg); border-radius: 12px; padding: 1.5rem;
                 max-width: 320px; width: 85%; text-align: center; }}
   .modal-box h1 {{ font-size: 1.1rem; }}
+  .busy-bar {{ height: 8px; border-radius: 4px; background: var(--box-bg); overflow: hidden; margin: .8rem 0 .3rem; }}
+  .busy-bar > div {{ height: 100%; width: 0; background: var(--btn-bg); transition: width .2s; }}
 """
 
 # Gleiche Wackel-Biene wie in beiden Vorlagen-Projekten - rein kosmetisch,
@@ -584,6 +586,83 @@ def render_system_buttons():
         reboot_frage=frage("Pi wirklich neu starten?"),
         shutdown_frage=frage("Pi wirklich herunterfahren? Danach muss der Strom manuell getrennt und "
                              "wieder verbunden werden, um ihn erneut zu starten."))
+
+# Warte-Fenster fuer Formulare mit data-busy="Titel" (optional data-busy-text,
+# data-upload="1"). Anlass 2026-10-11: Ein 83-MB-Backup vom iPhone hochladen
+# dauerte, und die Seite zeigte bis zum Ende gar nichts an. Upload-Formulare
+# laufen deshalb per XMLHttpRequest mit Fortschritt (die Server-Antwort ist
+# dieselbe Seite wie beim normalen Absenden und ersetzt danach die aktuelle).
+# Sperrt ausserdem alle Knoepfe gegen Doppeltippen. Laeuft NACH den
+# onsubmit-confirm()-Abfragen: abgebrochene Formulare (defaultPrevented)
+# werden ignoriert.
+BUSY_MODAL = """
+<div id="busy-modal" class="modal-backdrop">
+  <div class="modal-box">
+    <h1>""" + SPINNER_SVG + """<span id="busy-titel"></span></h1>
+    <div id="busy-bar" class="busy-bar" hidden><div></div></div>
+    <p id="busy-text" class="muted small"></p>
+  </div>
+</div>
+<script>
+(function () {
+  var laeuft = false;
+  var $ = function (id) { return document.getElementById(id); };
+  function zeige(titel, text) {
+    $('busy-titel').textContent = titel;
+    $('busy-text').textContent = text || '';
+    $('busy-modal').classList.add('show');
+  }
+  function knoepfe(an) {
+    document.querySelectorAll('button').forEach(function (b) { b.disabled = !an; });
+  }
+  function mb(bytes) { return (bytes / 1048576).toFixed(bytes < 10485760 ? 1 : 0).replace('.', ','); }
+  document.addEventListener('submit', function (e) {
+    var form = e.target;
+    if (e.defaultPrevented || !form.dataset || !form.dataset.busy) return;
+    if (laeuft) { e.preventDefault(); return; }
+    laeuft = true;
+    zeige(form.dataset.busy, form.dataset.busyText || 'Bitte die Seite nicht schließen.');
+    setTimeout(function () { knoepfe(false); }, 0);
+    if (!form.dataset.upload || !window.FormData || !window.XMLHttpRequest) return;
+    e.preventDefault();
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', form.action);
+    $('busy-bar').hidden = false;
+    xhr.upload.onprogress = function (ev) {
+      if (!ev.lengthComputable) return;
+      var p = Math.round(ev.loaded * 100 / ev.total);
+      $('busy-bar').firstElementChild.style.width = p + '%';
+      $('busy-text').textContent = p + ' % (' + mb(ev.loaded) + ' von ' + mb(ev.total) + ' MB)';
+    };
+    xhr.upload.onload = function () {
+      $('busy-bar').hidden = true;
+      zeige('Wird eingespielt …', form.dataset.busyNachUpload || 'Gleich fertig.');
+    };
+    xhr.onload = function () {
+      document.open(); document.write(xhr.responseText); document.close();
+      window.scrollTo(0, 0);  // Ergebnis-Meldung steht oben
+    };
+    xhr.onerror = xhr.ontimeout = function () {
+      $('busy-bar').hidden = true;
+      var biene = document.querySelector('#busy-modal .loading-bee');
+      if (biene) biene.style.display = 'none';
+      zeige('❌ Hochladen fehlgeschlagen',
+            'Die Verbindung zum Gerät wurde unterbrochen. Bitte erneut versuchen.');
+      var ok = document.createElement('button');
+      ok.type = 'button'; ok.textContent = 'OK';
+      ok.onclick = function () { location.reload(); };
+      $('busy-text').after(ok);
+    };
+    xhr.send(new FormData(form));
+  });
+  // Zurueck-Taste nach dem Absenden (Seite aus dem Browser-Cache): Fenster zu
+  window.addEventListener('pageshow', function (e) {
+    if (!e.persisted) return;
+    laeuft = false; knoepfe(true); $('busy-modal').classList.remove('show');
+  });
+})();
+</script>
+"""
 
 PAGE_LANDING = """<!doctype html>
 <html lang="de"><head>
@@ -965,7 +1044,7 @@ eine Sicherung pro Woche, Monat und Jahr. Einzige Einstellung ist die Gesamtanza
 </details>
 
 <a class="btn" href="/">← Zurück zur Übersicht</a>
-
+{busy_modal}
 <div id="format-modal" class="modal-backdrop">
   <div class="modal-box" id="format-modal-content"></div>
 </div>
@@ -1011,7 +1090,7 @@ PAGE_APP_BACKUPS = """<!doctype html>
 {header}
 <h1>{app_emoji} {app_label} – Backups</h1>
 {message}
-<form method="post" action="/backup/create/{app_id}">
+<form method="post" action="/backup/create/{app_id}" data-busy="Backup wird erstellt …">
   <input type="hidden" name="zurueck" value="app">
   <button type="submit">📦 Jetzt sichern</button>
 </form>
@@ -1027,7 +1106,10 @@ PAGE_APP_BACKUPS = """<!doctype html>
      Dateityp zuordnen, "Datei auswählen" tat dort gar nichts (2026-10-11).
      Was hochgeladen wird, prueft restore_backup_from_file() ohnehin selbst. -->
 <form method="post" action="/backup/restore-upload/{app_id}" enctype="multipart/form-data"
-      onsubmit="return confirmRestore('der ausgewählten Datei')">
+      onsubmit="return confirmRestore('der ausgewählten Datei')"
+      data-busy="Backup wird hochgeladen …" data-upload="1"
+      data-busy-text="Bitte die Seite nicht schließen."
+      data-busy-nach-upload="{app_label} wird kurz angehalten und mit dem Backup neu gestartet.">
   <label for="upload_file">Backup-Datei auswählen (.tar.gz oder .tar)</label>
   <input type="file" id="upload_file" name="file" required>
   <button type="submit" class="btn-danger">♻ Datei einspielen</button>
@@ -1035,6 +1117,7 @@ PAGE_APP_BACKUPS = """<!doctype html>
 </details>
 
 <a class="btn" href="/backup">← Zurück</a>
+{busy_modal}
 <script>
 var RESTORED_LABEL = {restored_label_js};
 function confirmRestore(name) {{
@@ -2219,14 +2302,14 @@ def render_backup_overview(message="", skip_remount=False):
 <h2>{app['emoji']} {html.escape(app['label'])}</h2>
 <p class="muted small" style="margin:.3rem 0 0;">{status}</p>
 <div class="btn-row bk-btns">
-  <form method="post" action="/backup/create/{app['id']}"><button type="submit" class="btn-small">📦 Sichern</button></form>
+  <form method="post" action="/backup/create/{app['id']}" data-busy="{html.escape(app['label'], quote=True)} wird gesichert …"><button type="submit" class="btn-small">📦 Sichern</button></form>
   <a class="btn btn-small btn-quiet" href="/backup/app/{app['id']}">🗂 Laden / Einspielen</a>
 </div>
 </div>""")
         app_sections = "".join(sections)
         if len(apps) > 1:
             all_backup_button = """
-<form method="post" action="/backup/create-all">
+<form method="post" action="/backup/create-all" data-busy="Alle Apps werden gesichert …">
   <button type="submit" style="margin:0 0 1rem;">📦 Alle jetzt sichern</button>
 </form>"""
         else:
@@ -2239,6 +2322,7 @@ def render_backup_overview(message="", skip_remount=False):
         all_backup_button=all_backup_button,
         usb_section=_usb_section_html(),
         max_backups=get_max_backups(),
+        busy_modal=BUSY_MODAL,
     )
 
 
@@ -2251,6 +2335,7 @@ def _backup_liste_html(app):
     if not eintraege:
         return '<p class="muted">Noch keine Backups vorhanden.</p>'
     zeilen = []
+    label_attr = html.escape(app["label"], quote=True)
     for e in eintraege:
         name = html.escape(e["name"])
         key = html.escape(f'{e["loc"]}|{e["name"]}', quote=True)
@@ -2261,7 +2346,8 @@ def _backup_liste_html(app):
             f'<span class="muted small">{_backup_groesse(e["size_mb"])} · {" + ".join(e["orte"])}</span></div>'
             f'<a class="btn btn-small btn-quiet bk-act" href="/backup/download/{app["id"]}/{e["loc"]}/{name}" '
             f'title="{name} herunterladen">⬇ Laden</a>'
-            f'<form method="post" action="/backup/restore/{app["id"]}" onsubmit="return confirmRestore({name_js})">'
+            f'<form method="post" action="/backup/restore/{app["id"]}" onsubmit="return confirmRestore({name_js})" '
+            f'data-busy="Backup wird eingespielt …" data-busy-text="{label_attr} wird kurz angehalten und neu gestartet.">'
             f'<input type="hidden" name="backup_key" value="{key}">'
             '<button type="submit" class="btn-small btn-quiet bk-act">♻ Einspielen</button></form>'
             '</div>'
@@ -2285,6 +2371,7 @@ def render_app_backups_page(app, message=""):
         app_label=html.escape(app["label"]),
         restored_label=html.escape(restored_label),
         restored_label_js=json.dumps(restored_label),
+        busy_modal=BUSY_MODAL,
     )
 
 
