@@ -126,7 +126,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
-PORTAL_VERSION = "1.8.24"
+PORTAL_VERSION = "1.8.25"
 
 PORTAL_DIR = "/opt/setup-portal"
 # Jede App legt hier per eigenem install.sh genau eine Datei <app-id>.json
@@ -498,6 +498,19 @@ STYLE = """
   .pill-stale {{ background: transparent; color: var(--muted); border: 1px solid var(--muted); font-weight: normal; }}
   .btn-quiet {{ background: transparent; color: var(--fg); border: 1px solid var(--muted); font-weight: normal; }}
   .btn-quiet:active {{ background: var(--input-border); }}
+  .bk-btns {{ margin-top: .7rem; }}
+  .bk-btns > * {{ flex: 1; }}
+  .bk-btns form button {{ height: 100%; }}
+  .bk-usb {{ display: flex; align-items: center; justify-content: space-between; gap: .6rem; }}
+  .bk-usb form {{ margin: 0; flex: none; }}
+  .bk-usb button {{ width: auto; }}
+  .bk-settings {{ margin: .4rem 0 0; }}
+  .bk-list {{ margin-bottom: 1rem; }}
+  .bk-row {{ display: flex; align-items: center; gap: .4rem; padding: .55rem 0;
+            border-top: 1px solid var(--input-border); }}
+  .bk-info {{ flex: 1; min-width: 0; display: flex; flex-direction: column; }}
+  .bk-row form {{ margin: 0; }}
+  .bk-act {{ width: auto; margin: 0; padding: .45rem .55rem; font-size: .8rem; white-space: nowrap; }}
   details.notes, details.more {{ margin-top: .9rem; }}
   details > summary {{ cursor: pointer; color: var(--muted); }}
   details.more[open] > summary {{ margin-bottom: .3rem; }}
@@ -933,26 +946,23 @@ PAGE_BACKUP = """<!doctype html>
 {header}
 <h1>📦 Backups</h1>
 {message}
-{app_sections}
 {all_backup_button}
+{app_sections}
+{usb_section}
 
-<h2>Einstellungen</h2>
-<p class="muted">Backups laufen automatisch jede Nacht (03:30 Uhr) – aber nur, wenn sich
-seit dem letzten Backup etwas geändert hat, sonst wird nichts geschrieben
-(schont die SD-Karte). Aufbewahrung
-nach dem Vater-Sohn-Prinzip: die letzten 14 Tage einzeln, danach automatisch
-ausgedünnt auf eine Sicherung pro Woche, Monat und Jahr – so bleibt auch
-ältere Historie sinnvoll erhalten, ohne dass du Zeitpläne oder Stufen selbst
-verwalten musst. Einzige Einstellung ist die Gesamtanzahl (gilt gemeinsam
-für alle Apps je Ort).</p>
+<details class="more bk-settings">
+<summary>⚙️ Einstellungen · max. {max_backups} Backups je Ort, nachts 03:30</summary>
+<p class="muted small">Backups laufen automatisch jede Nacht (03:30 Uhr) – aber nur, wenn sich
+seit dem letzten Backup etwas geändert hat (schont die SD-Karte). Aufbewahrung
+nach dem Vater-Sohn-Prinzip: die letzten 14 Tage einzeln, danach ausgedünnt auf
+eine Sicherung pro Woche, Monat und Jahr. Einzige Einstellung ist die Gesamtanzahl
+(gilt gemeinsam für alle Apps je Ort).</p>
 <form method="post" action="/backup/settings">
   <label for="max_backups">Max. Anzahl Backups insgesamt (je Ort)</label>
   <input type="number" id="max_backups" name="max_backups" min="20" max="200" value="{max_backups}">
   <button type="submit">Einstellung speichern</button>
 </form>
-
-<h2>USB-Stick</h2>
-{usb_section}
+</details>
 
 <a class="btn" href="/">← Zurück zur Übersicht</a>
 
@@ -987,67 +997,52 @@ function startFormat(form, warning) {{
 </body></html>
 """
 
-PAGE_RESTORE = """<!doctype html>
+# Eine Seite je App fuer Herunterladen UND Wiederherstellen (bis 2026-10-11
+# zwei getrennte Seiten mit je einer Auswahlliste - auf dem Handy doppelt und
+# unuebersichtlich). Erreichbar ueber /backup/app/<id>; die alten Adressen
+# /backup/restore/<id> und /backup/downloads/<id> zeigen dieselbe Seite.
+PAGE_APP_BACKUPS = """<!doctype html>
 <html lang="de"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Backup wiederherstellen</title>
+<title>Backups {app_label}</title>
 <style>""" + STYLE + """</style>
 </head><body>
 {header}
-<h1>♻ {app_emoji} {app_label} wiederherstellen</h1>
-<p>Ersetzt <strong>{restored_label}</strong> durch den gewählten Stand.
-Der App-Code bleibt unangetastet. {app_label} startet danach automatisch neu
-und ist sofort wieder voll funktionsfähig.</p>
+<h1>{app_emoji} {app_label} – Backups</h1>
 {message}
-<form method="post" action="/backup/restore/{app_id}"
-      onsubmit="return confirmRestore(this.querySelector('select').selectedOptions[0]
-                ? this.querySelector('select').selectedOptions[0].text : 'diesem Backup')">
-  <label for="backup_select">Vorhandenes Backup auswählen</label>
-  <select id="backup_select" name="backup_key">
-    {options}
-  </select>
-  <button type="submit" class="btn-danger">Backup wiederherstellen</button>
+<form method="post" action="/backup/create/{app_id}">
+  <input type="hidden" name="zurueck" value="app">
+  <button type="submit">📦 Jetzt sichern</button>
 </form>
+<h2>Vorhandene Backups</h2>
+<p class="muted small">⬇ Laden speichert das Backup auf diesem Gerät. ♻ Einspielen ersetzt
+<strong>{restored_label}</strong> durch diesen Stand – der App-Code bleibt unangetastet,
+{app_label} startet danach automatisch neu.</p>
+{backup_list}
 
-<h2>Backup direkt vom PC wiederherstellen</h2>
+<details class="more">
+<summary>♻ Backup-Datei von diesem Gerät einspielen</summary>
+<!-- Bewusst KEIN accept-Attribut: Safari auf dem iPhone kann ".tar.gz" keinem
+     Dateityp zuordnen, "Datei auswählen" tat dort gar nichts (2026-10-11).
+     Was hochgeladen wird, prueft restore_backup_from_file() ohnehin selbst. -->
 <form method="post" action="/backup/restore-upload/{app_id}" enctype="multipart/form-data"
       onsubmit="return confirmRestore('der ausgewählten Datei')">
-  <label for="upload_file">Backup-Datei auf diesem PC auswählen (.tar.gz)</label>
-  <input type="file" id="upload_file" name="file" accept=".gz,.tar.gz" required>
-  <button type="submit" class="btn-danger">Backup vom PC wiederherstellen</button>
+  <label for="upload_file">Backup-Datei auswählen (.tar.gz oder .tar)</label>
+  <input type="file" id="upload_file" name="file" required>
+  <button type="submit" class="btn-danger">♻ Datei einspielen</button>
 </form>
+</details>
 
 <a class="btn" href="/backup">← Zurück</a>
 <script>
+var RESTORED_LABEL = {restored_label_js};
 function confirmRestore(name) {{
-  return confirm('{restored_label} wirklich aus "' + name + '" wiederherstellen? ' +
+  return confirm(RESTORED_LABEL + ' wirklich aus „' + name + '“ wiederherstellen? ' +
                  'Alle Änderungen seit diesem Backup gehen dabei verloren.') &&
          confirm('Ganz sicher? Dieser Schritt lässt sich nicht rückgängig machen.');
 }}
 </script>
-</body></html>
-"""
-
-PAGE_DOWNLOAD_SELECT = """<!doctype html>
-<html lang="de"><head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Backup herunterladen</title>
-<style>""" + STYLE + """</style>
-</head><body>
-{header}
-<h1>⬇ {app_emoji} {app_label} – Backup herunterladen</h1>
-<p>Lädt das gewählte Backup-Archiv auf dieses Gerät herunter.</p>
-<form onsubmit="event.preventDefault(); var v = document.getElementById('download_select').value;
-                if (v) window.location.href = '/backup/download/{app_id}/' + v.replace('|', '/');">
-  <label for="download_select">Vorhandenes Backup auswählen</label>
-  <select id="download_select" name="backup_key">
-    {options}
-  </select>
-  <button type="submit">⬇ Backup herunterladen</button>
-</form>
-<a class="btn" href="/backup">← Zurück</a>
 </body></html>
 """
 
@@ -1846,9 +1841,13 @@ def restore_backup(app, location, filename):
 
 
 def restore_backup_from_file(app, pfad, filename):
+    # "r:*" statt "r:gz": Safari/Dateien-App auf dem iPhone entpacken einen
+    # .tar.gz-Download gern selbst zu .tar - das soll trotzdem gehen.
     try:
-        with tarfile.open(pfad, mode="r:gz") as tar:
+        with tarfile.open(pfad, mode="r:*") as tar:
             return _restore_from_tar(app, tar, filename or "der hochgeladenen Datei")
+    except tarfile.ReadError:
+        return False, "Die ausgewählte Datei ist kein Backup-Archiv (.tar.gz oder .tar)."
     except (tarfile.TarError, OSError, EOFError) as e:
         return False, f"Fehler beim Lesen der hochgeladenen Datei: {e}"
 
@@ -2099,14 +2098,13 @@ def _usb_section_html():
     usb_disks = list_usb_disks()
     parts = []
     if usb_mounted:
+        # Eine Zeile statt Kasten + grossem Knopf (Uebersicht passt so aufs Handy)
         parts.append(
-            f'<div class="msg ok">📦 USB-Stick eingerichtet ({disk_usage(USB_MOUNT)}) – '
-            f'Backups werden {LOCAL_BACKUP_PHRASE} und zusätzlich hier abgelegt.</div>'
-        )
-        parts.append(
+            '<div class="msg ok bk-usb">'
+            f'<span>💾 USB-Stick: {disk_usage(USB_MOUNT)}</span>'
             '<form method="post" action="/backup/usb/eject" '
             'onsubmit="return confirm(\'USB-Stick sicher aushängen? Danach kann er entfernt werden.\');">'
-            '<button type="submit">⏏ USB-Stick sicher entfernen</button></form>'
+            '<button type="submit" class="btn-small btn-quiet">⏏ Auswerfen</button></form></div>'
         )
     elif usb_disks:
         for d in usb_disks:
@@ -2141,8 +2139,40 @@ def _usb_section_html():
             'diese Seite neu laden, um ihn einzurichten.</div>'
         )
     else:
-        parts.append('<p class="muted">Kein USB-Stick angeschlossen – optional, nicht erforderlich.</p>')
+        parts.append('<p class="muted small">💾 Kein USB-Stick angeschlossen – optional, nicht erforderlich.</p>')
     return "".join(parts)
+
+
+def _backup_eintraege(app):
+    """Alle Backups einer App, neueste zuerst. Liegt dasselbe Backup lokal UND
+    auf dem USB-Stick, ist das EIN Eintrag mit beiden Orten (vorher stand es
+    doppelt in der Auswahlliste). Aktionen nutzen den ersten Ort (lokal)."""
+    try_remount_usb()
+    prefix = app["backup"]["prefix"]
+    quellen = [("local", LOCAL_BACKUP_LABEL, BACKUP_DIR)]
+    if os.path.ismount(USB_MOUNT):
+        quellen.append(("usb", "USB", USB_MOUNT))
+    eintraege = {}
+    for loc, label, directory in quellen:
+        for b in list_backups(directory, prefix):
+            e = eintraege.setdefault(b["name"], dict(b, orte=[], loc=loc))
+            e["orte"].append(label)
+    return sorted(eintraege.values(), key=lambda e: e["name"], reverse=True)
+
+
+def _backup_zeit(mtime):
+    """'2026-10-11 14:55' -> 'heute 14:55' / 'gestern 03:30' / '05.10.2026 03:30'."""
+    try:
+        t = datetime.strptime(mtime, "%Y-%m-%d %H:%M")
+    except (TypeError, ValueError):
+        return mtime or "?"
+    tage = (datetime.now().date() - t.date()).days
+    tag = {0: "heute", 1: "gestern"}.get(tage, t.strftime("%d.%m.%Y"))
+    return f"{tag} {t.strftime('%H:%M')}"
+
+
+def _backup_groesse(size_mb):
+    return f"{size_mb} MB".replace(".", ",")
 
 
 def render_backup_overview(message="", skip_remount=False):
@@ -2157,32 +2187,27 @@ def render_backup_overview(message="", skip_remount=False):
     else:
         sections = []
         for app in apps:
-            prefix = app["backup"]["prefix"]
-            entries = [(b, LOCAL_BACKUP_LABEL) for b in list_backups(BACKUP_DIR, prefix)]
-            if os.path.ismount(USB_MOUNT):
-                entries += [(b, "USB-Stick") for b in list_backups(USB_MOUNT, prefix)]
-            entries.sort(key=lambda e: e[0]["name"], reverse=True)
-            if entries:
-                b0, loc0 = entries[0]
-                latest_info = f'<p class="muted" style="font-size:.85rem;">Letztes Backup: {b0["name"]} ({b0["mtime"]}, {loc0})</p>'
+            eintraege = _backup_eintraege(app)
+            if eintraege:
+                e0 = eintraege[0]
+                status = (f'Letztes: {_backup_zeit(e0["mtime"])} · {" + ".join(e0["orte"])} · '
+                          f'{len(eintraege)} Backup{"s" if len(eintraege) != 1 else ""}')
             else:
-                latest_info = '<p class="muted" style="font-size:.85rem;">Noch keine Backups vorhanden.</p>'
+                status = "Noch kein Backup"
             sections.append(f"""
 <div class="msg app-section">
 <h2>{app['emoji']} {html.escape(app['label'])}</h2>
-{latest_info}
-<form method="post" action="/backup/create/{app['id']}">
-  <button type="submit">📦 Jetzt sichern</button>
-</form>
-<a class="btn" href="/backup/restore/{app['id']}">♻ Wiederherstellen</a>
-<a class="btn" href="/backup/downloads/{app['id']}">⬇ Herunterladen</a>
+<p class="muted small" style="margin:.3rem 0 0;">{status}</p>
+<div class="btn-row bk-btns">
+  <form method="post" action="/backup/create/{app['id']}"><button type="submit" class="btn-small">📦 Sichern</button></form>
+  <a class="btn btn-small btn-quiet" href="/backup/app/{app['id']}">🗂 Laden / Einspielen</a>
+</div>
 </div>""")
         app_sections = "".join(sections)
         if len(apps) > 1:
-            emojis = "".join(a["emoji"] for a in apps)
-            all_backup_button = f"""
+            all_backup_button = """
 <form method="post" action="/backup/create-all">
-  <button type="submit">{emojis} Alle sichern</button>
+  <button type="submit" style="margin:0 0 1rem;">📦 Alle jetzt sichern</button>
 </form>"""
         else:
             all_backup_button = ""
@@ -2197,39 +2222,49 @@ def render_backup_overview(message="", skip_remount=False):
     )
 
 
-def backup_options_html(app):
-    try_remount_usb()
-    prefix = app["backup"]["prefix"]
-    entries = [(b, "local", LOCAL_BACKUP_LABEL) for b in list_backups(BACKUP_DIR, prefix)]
-    if os.path.ismount(USB_MOUNT):
-        entries += [(b, "usb", "USB-Stick") for b in list_backups(USB_MOUNT, prefix)]
-    entries.sort(key=lambda e: e[0]["name"], reverse=True)
-    if not entries:
-        return '<option value="">– keine Backups vorhanden –</option>'
-    return "".join(
-        f'<option value="{loc}|{b["name"]}">{b["name"]} ({b["mtime"]}, {label})</option>'
-        for b, loc, label in entries)
+# So viele Backups stehen offen in der Liste, der Rest unter "Aeltere Backups".
+BACKUP_LISTE_SICHTBAR = 8
 
 
-def render_restore_page(app, message=""):
-    return PAGE_RESTORE.format(
+def _backup_liste_html(app):
+    eintraege = _backup_eintraege(app)
+    if not eintraege:
+        return '<p class="muted">Noch keine Backups vorhanden.</p>'
+    zeilen = []
+    for e in eintraege:
+        name = html.escape(e["name"])
+        key = html.escape(f'{e["loc"]}|{e["name"]}', quote=True)
+        name_js = html.escape(json.dumps(f'{_backup_zeit(e["mtime"])} ({e["name"]})'), quote=True)
+        zeilen.append(
+            '<div class="bk-row">'
+            f'<div class="bk-info"><strong>{_backup_zeit(e["mtime"])}</strong>'
+            f'<span class="muted small">{_backup_groesse(e["size_mb"])} · {" + ".join(e["orte"])}</span></div>'
+            f'<a class="btn btn-small btn-quiet bk-act" href="/backup/download/{app["id"]}/{e["loc"]}/{name}" '
+            f'title="{name} herunterladen">⬇ Laden</a>'
+            f'<form method="post" action="/backup/restore/{app["id"]}" onsubmit="return confirmRestore({name_js})">'
+            f'<input type="hidden" name="backup_key" value="{key}">'
+            '<button type="submit" class="btn-small btn-quiet bk-act">♻ Einspielen</button></form>'
+            '</div>'
+        )
+    sichtbar = "".join(zeilen[:BACKUP_LISTE_SICHTBAR])
+    rest = zeilen[BACKUP_LISTE_SICHTBAR:]
+    if rest:
+        sichtbar += (f'<details class="more"><summary>Ältere Backups ({len(rest)})</summary>'
+                     + "".join(rest) + '</details>')
+    return f'<div class="bk-list">{sichtbar}</div>'
+
+
+def render_app_backups_page(app, message=""):
+    restored_label = app["backup"].get("restored_label", "Daten")
+    return PAGE_APP_BACKUPS.format(
         header=render_header(),
         message=message,
-        options=backup_options_html(app),
+        backup_list=_backup_liste_html(app),
         app_id=app["id"],
         app_emoji=app["emoji"],
         app_label=html.escape(app["label"]),
-        restored_label=app["backup"].get("restored_label", "Daten"),
-    )
-
-
-def render_download_select_page(app):
-    return PAGE_DOWNLOAD_SELECT.format(
-        header=render_header(),
-        options=backup_options_html(app),
-        app_id=app["id"],
-        app_emoji=app["emoji"],
-        app_label=html.escape(app["label"]),
+        restored_label=html.escape(restored_label),
+        restored_label_js=json.dumps(restored_label),
     )
 
 
@@ -4039,21 +4074,15 @@ class BaseHandler(BaseHTTPRequestHandler):
         if path == "/backup":
             self._send_html(render_backup_overview())
             return
-        m = re.match(r"^/backup/restore/([^/]+)$", path)
+        # /backup/restore/<id> und /backup/downloads/<id>: alte Adressen (bis
+        # v1.8.24 zwei getrennte Seiten), zeigen jetzt dieselbe Seite.
+        m = re.match(r"^/backup/(app|restore|downloads)/([^/]+)$", path)
         if m:
-            app = get_app(unquote(m.group(1)))
+            app = get_app(unquote(m.group(2)))
             if not app:
                 self._not_found()
                 return
-            self._send_html(render_restore_page(app))
-            return
-        m = re.match(r"^/backup/downloads/([^/]+)$", path)
-        if m:
-            app = get_app(unquote(m.group(1)))
-            if not app:
-                self._not_found()
-                return
-            self._send_html(render_download_select_page(app))
+            self._send_html(render_app_backups_page(app))
             return
         if path == "/backup/usb/format-status":
             self._send_json(FORMAT_STATE)
@@ -4151,10 +4180,16 @@ class BaseHandler(BaseHTTPRequestHandler):
             if not app:
                 self._not_found()
                 return
+            length = int(self.headers.get("Content-Length", 0))
+            fields = parse_qs(self.rfile.read(length).decode("utf-8")) if length else {}
             ok, detail = create_backup_now(app)
             msg = ('<div class="msg ok">✅ Backup erstellt.</div>' if ok
-                   else f'<div class="msg err">Fehler: {detail}</div>')
-            self._send_html(render_backup_overview(msg))
+                   else f'<div class="msg err">Fehler: {html.escape(detail)}</div>')
+            # Von der App-Seite aus gesichert -> dort bleiben
+            if fields.get("zurueck", [""])[0] == "app":
+                self._send_html(render_app_backups_page(app, msg))
+            else:
+                self._send_html(render_backup_overview(msg))
             return
         if path == "/backup/create-all":
             apps = load_apps()
@@ -4181,11 +4216,11 @@ class BaseHandler(BaseHTTPRequestHandler):
             backup_key = fields.get("backup_key", [""])[0]
             location, _, filename = backup_key.partition("|")
             if not filename:
-                self._send_html(render_restore_page(app, '<div class="msg err">Bitte ein Backup auswählen.</div>'))
+                self._send_html(render_app_backups_page(app, '<div class="msg err">Bitte ein Backup auswählen.</div>'))
                 return
             ok, detail = self._restore_locked(app, restore_backup, app, location, filename)
             msg = (f'<div class="msg ok">✅ {detail}</div>' if ok else f'<div class="msg err">{detail}</div>')
-            self._send_html(render_restore_page(app, msg))
+            self._send_html(render_app_backups_page(app, msg))
             return
         m = re.match(r"^/backup/restore-upload/([^/]+)$", path)
         if m:
@@ -4203,16 +4238,16 @@ class BaseHandler(BaseHTTPRequestHandler):
                     filename = parse_multipart_datei(roh, content_type, archiv)
                     os.remove(roh)
                 except OSError as e:
-                    self._send_html(render_restore_page(
+                    self._send_html(render_app_backups_page(
                         app, f'<div class="msg err">Upload konnte nicht gespeichert werden: {html.escape(str(e))}</div>'))
                     return
                 if not filename:
-                    self._send_html(render_restore_page(
+                    self._send_html(render_app_backups_page(
                         app, '<div class="msg err">Keine Datei hochgeladen oder Datei nicht lesbar.</div>'))
                     return
                 ok, detail = self._restore_locked(app, restore_backup_from_file, app, archiv, filename)
             msg = (f'<div class="msg ok">✅ {detail}</div>' if ok else f'<div class="msg err">{detail}</div>')
-            self._send_html(render_restore_page(app, msg))
+            self._send_html(render_app_backups_page(app, msg))
             return
         if path == "/backup/settings":
             length = int(self.headers.get("Content-Length", 0))
