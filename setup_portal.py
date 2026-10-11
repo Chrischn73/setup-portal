@@ -126,7 +126,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
-PORTAL_VERSION = "1.8.25"
+PORTAL_VERSION = "1.8.26"
 
 PORTAL_DIR = "/opt/setup-portal"
 # Jede App legt hier per eigenem install.sh genau eine Datei <app-id>.json
@@ -1735,6 +1735,25 @@ def create_backup_now(app):
     return result.returncode == 0, (result.stderr or result.stdout).strip()
 
 
+def _falsches_archiv_meldung(app, members, label):
+    """Fehlertext, wenn im Archiv der Daten-Ordner der App fehlt - mit dem,
+    was tatsaechlich drin ist, und (falls erkennbar) zu welcher anderen App
+    es gehoert. Anlass 2026-10-11: HonigBox-Backup versehentlich bei der
+    Imker-App hochgeladen, die Meldung "'imkerei/data' nicht im Archiv
+    gefunden" verriet nicht, was stattdessen ankam."""
+    oben = sorted({m.name.split("/", 1)[0] for m in members if m.name.strip("/")})
+    inhalt = ", ".join(f"{n}/" for n in oben[:5]) if oben else "nichts"
+    if len(oben) > 5:
+        inhalt += f" und {len(oben) - 5} weitere"
+    passt_zu = [a["label"] for a in load_apps() if a["id"] != app["id"]
+                and a["backup"]["restore_data_prefix"].split("/", 1)[0] in oben]
+    text = (f"„{label}“ ist kein Backup von {app['label']}: der Ordner "
+            f"'{app['backup']['restore_data_prefix']}' fehlt, enthalten ist {inhalt}.")
+    if passt_zu:
+        text += f" Das ist vermutlich ein Backup von {passt_zu[0]}."
+    return text + f" {app['label']} wurde nicht verändert."
+
+
 def _restore_from_tar(app, tar, label):
     """Ersetzt genau den in app['backup']['restore_target_dir'] konfigurierten
     Ordner durch den Inhalt des geoeffneten tar-Archivs (App-Code bleibt
@@ -1776,16 +1795,17 @@ def _restore_from_tar(app, tar, label):
         except (OSError, subprocess.TimeoutExpired, ValueError):
             pass  # Hook-Fehler duerfen den eigentlichen Restore nicht verhindern
 
+    # Erst pruefen, dann Dienste anhalten: bei einer falschen Datei bleibt
+    # die App einfach weiterlaufen (bis v1.8.25 Stopp + Neustart umsonst).
+    alle = tar.getmembers()
+    members = [m for m in alle if m.name == prefix or m.name.startswith(prefix + "/")]
+    if not members:
+        return False, _falsches_archiv_meldung(app, alle, label)
+
     for svc in stop_services:
         subprocess.run(["systemctl", "stop", svc], capture_output=True, text=True)
     _run_hook(pre_hook)
     try:
-        members = [m for m in tar.getmembers()
-                   if m.name == prefix or m.name.startswith(prefix + "/")]
-        if not members:
-            _run_hook(post_hook)
-            _restart_services()
-            return False, f"'{prefix}' nicht im Archiv gefunden."
         with tempfile.TemporaryDirectory() as tmpdir:
             tar.extractall(path=tmpdir, members=members, filter="data")
             extracted_dir = os.path.join(tmpdir, prefix)
