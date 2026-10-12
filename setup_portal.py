@@ -126,7 +126,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
-PORTAL_VERSION = "1.8.27"
+PORTAL_VERSION = "1.8.28"
 
 PORTAL_DIR = "/opt/setup-portal"
 # Jede App legt hier per eigenem install.sh genau eine Datei <app-id>.json
@@ -3168,6 +3168,7 @@ def run_update_check_once(app, allow_auto=True):
     # last_ping_date/auto_install (von anderen Prozessen geschrieben) verloren.
     state = read_update_check_state(app)
     auto_updated_version = state.get("auto_updated_version")
+    auto_updated_at = state.get("auto_updated_at")
     auto_update_due_at = None
     if update_available and get_auto_update(app_id) and release.get("tarball_url"):
         due_at, _urgent = auto_update_due(app, current, fetch_all_releases(app) or [release])
@@ -3191,6 +3192,7 @@ def run_update_check_once(app, allow_auto=True):
                             current = app_version(app)
                             update_available = False
                             auto_updated_version = current
+                            auto_updated_at = time.time()
                             if get_auto_install_sh(app_id) and install_sh_changed(app, release["tag"]):
                                 _start_auto_install_sh(app)
         else:
@@ -3215,9 +3217,35 @@ def run_update_check_once(app, allow_auto=True):
         "checked_at": time.strftime("%Y-%m-%d %H:%M"),
         "notes": (release.get("notes") if release else None),
         "auto_updated_version": auto_updated_version,
+        "auto_updated_at": auto_updated_at,
         "auto_update_due_at": auto_update_due_at,
     })
     _write_update_check_state(app_id, state)
+
+
+AUTO_UPDATE_HINWEIS_TAGE = 3
+
+
+def auto_update_hinweis(app, state=None):
+    """Hinweistext "wurde automatisch aktualisiert" fuer Startseite und
+    /update - oder None. Nur in den ersten AUTO_UPDATE_HINWEIS_TAGE nach dem
+    naechtlichen Update und nur, solange genau diese Version installiert ist
+    (danach von Hand weiter- oder zurueckgewechselt = Hinweis waere falsch).
+    Vorher lief ein Auto-Update komplett unbemerkt: auto_updated_version
+    wurde zwar gespeichert, aber nirgends angezeigt."""
+    if state is None:
+        state = read_update_check_state(app)
+    wann = state.get("auto_updated_at")
+    version = state.get("auto_updated_version")
+    if not wann or not version:
+        return None
+    if time.time() - wann > AUTO_UPDATE_HINWEIS_TAGE * 86400:
+        return None
+    if app_version(app) != version:
+        return None
+    zeit = time.localtime(wann)
+    return (f"✅ {app['label']} wurde am {time.strftime('%d.%m.', zeit)} um "
+            f"{time.strftime('%H:%M', zeit)} Uhr automatisch auf {version} aktualisiert.")
 
 
 def _start_auto_install_sh(app):
@@ -3694,6 +3722,10 @@ def render_update_card(app):
             else:
                 pill = _stand_pill("aktuell", stand)
 
+    hinweis = auto_update_hinweis(app)
+    if hinweis:
+        blocks.insert(0, f'<div class="msg ok small">{html.escape(hinweis)}</div>')
+
     last_auto_install = read_update_check_state(app).get("auto_install") or {}
     if last_auto_install.get("detail") and not last_auto_install.get("ok"):
         blocks.append(
@@ -3978,6 +4010,9 @@ def render_landing(request_host=None):
                 f'<div class="msg ok">🔄 Update verfügbar für {html.escape(app["label"])}: '
                 f'Version {state["latest"]}</div>'
             )
+        hinweis = auto_update_hinweis(app, state)
+        if hinweis:
+            update_banner_parts.append(f'<div class="msg ok">{html.escape(hinweis)}</div>')
     update_banner = "".join(update_banner_parts)
 
     if IS_PI:
