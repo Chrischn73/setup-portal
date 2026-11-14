@@ -126,7 +126,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
-PORTAL_VERSION = "1.8.28"
+PORTAL_VERSION = "1.8.29"
 
 PORTAL_DIR = "/opt/setup-portal"
 # Jede App legt hier per eigenem install.sh genau eine Datei <app-id>.json
@@ -154,7 +154,7 @@ PORT_LANDING = int(os.environ.get("SETUP_PORTAL_LANDING_PORT", "80"))
 
 # Wird von do_POST() waehrend eines WLAN-Verbindungsversuchs aktualisiert und
 # von GET /wifi/status abgefragt (Polling von der "Verbinde..."-Seite aus).
-CONN_STATE = {"done": False, "ok": None, "detail": None}
+CONN_STATE = {"done": False, "ok": None, "detail": None, "saved": False, "ssid": None}
 
 # Wird waehrend des (langwierigen) Formatierens eines USB-Sticks aktualisiert
 # und von GET /backup/usb/format-status abgefragt. EIN globaler USB-Stick
@@ -932,6 +932,7 @@ PAGE_FORM = """<!doctype html>
   <button type="submit">Verbinden</button>
 </form>
 {disconnect_form}
+{saved_profiles}
 <a class="btn" href="/" style="margin-top:1.5rem;">← Zurück zur Übersicht</a>
 <script>
 fetch('/wifi/networks').then(r => r.json()).then(function(nets) {{
@@ -1004,6 +1005,12 @@ function esc(t) {{ var d = document.createElement('div'); d.textContent = t; ret
       setTimeout(function() {{
         window.location.href = 'http://' + location.hostname + '/';
       }}, 2500);
+    }} else if (data.saved) {{
+      el.innerHTML = '<div class="msg warn">⚠️ Verbindung jetzt nicht möglich'
+        + (data.detail ? ' (' + esc(data.detail) + ')' : '') + '.<br><br>'
+        + '💾 Die Zugangsdaten für „' + esc(data.ssid) + '“ sind aber gespeichert. Die Box verbindet '
+        + 'sich automatisch, sobald dieses WLAN in Reichweite ist.</div>'
+        + '<a class="btn" href="/wifi">Zurück zu den WLAN-Einstellungen</a>';
     }} else {{
       el.innerHTML = '<div class="msg err">❌ Verbindung fehlgeschlagen'
         + (data.detail ? ': ' + esc(data.detail) : '') + '</div>'
@@ -1745,9 +1752,12 @@ def connect_wifi(ssid, password):
     cmd = ["nmcli", "device", "wifi", "connect", ssid, "ifname", "wlan0"]
     if password:
         cmd += ["password", password]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
-    ok = result.returncode == 0
-    detail = (result.stderr or result.stdout).strip()
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
+        ok = result.returncode == 0
+        detail = (result.stderr or result.stdout).strip()
+    except subprocess.TimeoutExpired:
+        ok, detail = False, "Zeitüberschreitung beim Verbinden"
 
     if not ok and previous:
         rollback = subprocess.run(
@@ -1760,6 +1770,95 @@ def connect_wifi(ssid, password):
             detail += f" (Wiederherstellen von '{previous}' ebenfalls fehlgeschlagen!)"
 
     return ok, detail
+
+
+def save_wifi_profile(ssid, password):
+    """Legt ein WLAN-Profil an, OHNE sich zu verbinden - fuer den Fall, dass
+    die Box fuer ein Netz vorbereitet wird, das gerade nicht in Reichweite ist.
+    Hintergrund: "nmcli device wifi connect" legt bei nicht gefundenem Netz gar
+    kein Profil an und loescht es bei fehlgeschlagener Aktivierung wieder.
+    Mit autoconnect verbindet NetworkManager sich spaeter von selbst, sobald
+    das Netz auftaucht und wlan0 frei ist (eine bestehende Verbindung wird
+    dabei nicht verdraengt). Erst NACH dem Rueckfall auf die alte Verbindung
+    aufrufen, sonst konkurriert das neue Profil darum.
+    Rueckgabe (ok, fehlertext)."""
+    if password and not (8 <= len(password) <= 63
+                         or (len(password) == 64 and re.fullmatch(r"[0-9a-fA-F]{64}", password))):
+        return False, "WLAN-Passwörter (WPA) müssen 8 bis 63 Zeichen lang sein."
+    # Ein evtl. halb angelegtes Profil gleichen Namens vorher entfernen.
+    subprocess.run(["nmcli", "connection", "delete", ssid], capture_output=True, text=True)
+    cmd = ["nmcli", "connection", "add", "type", "wifi", "con-name", ssid,
+           "ifname", "wlan0", "ssid", ssid, "connection.autoconnect", "yes"]
+    if password:
+        cmd += ["wifi-sec.key-mgmt", "wpa-psk", "wifi-sec.psk", password]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+    except subprocess.TimeoutExpired:
+        return False, "Zeitüberschreitung beim Speichern"
+    return result.returncode == 0, (result.stderr or result.stdout).strip()
+
+
+def _nmcli_unescape(feld):
+    """nmcli -t maskiert ':' und '\\' in Feldern mit Backslash."""
+    return re.sub(r"\\(.)", r"\1", feld)
+
+
+def saved_wifi_profiles():
+    """Liste (uuid, name, aktiv) aller gespeicherten WLAN-Profile."""
+    try:
+        alle = subprocess.run(
+            ["nmcli", "-t", "-f", "UUID,TYPE,NAME", "connection", "show"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout
+        aktiv = subprocess.run(
+            ["nmcli", "-t", "-f", "UUID", "connection", "show", "--active"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout.split()
+    except (subprocess.TimeoutExpired, OSError):
+        return []
+    profile = []
+    for line in alle.splitlines():
+        # UUID und TYPE enthalten nie ':' - der Rest ist der (maskierte) Name.
+        parts = line.split(":", 2)
+        if len(parts) == 3 and parts[1] == "802-11-wireless":
+            profile.append((parts[0], _nmcli_unescape(parts[2]), parts[0] in aktiv))
+    profile.sort(key=lambda p: p[1].lower())
+    return profile
+
+
+def delete_wifi_profile(uuid):
+    """Loescht ein gespeichertes WLAN-Profil - nie das gerade aktive."""
+    if not re.fullmatch(r"[0-9a-fA-F-]{36}", uuid or ""):
+        return False, "Ungültige Profil-ID."
+    for p_uuid, name, aktiv in saved_wifi_profiles():
+        if p_uuid == uuid:
+            if aktiv:
+                return False, f"„{name}“ ist gerade verbunden und kann nicht gelöscht werden."
+            r = subprocess.run(["nmcli", "connection", "delete", "uuid", uuid],
+                               capture_output=True, text=True, timeout=15)
+            return r.returncode == 0, name if r.returncode == 0 else (r.stderr or r.stdout).strip()
+    return False, "Profil nicht gefunden."
+
+
+def render_saved_profiles():
+    profile = saved_wifi_profiles()
+    if not profile:
+        return ""
+    zeilen = []
+    for uuid, name, aktiv in profile:
+        if aktiv:
+            knopf = '<span class="pill pill-ok">verbunden</span>'
+        else:
+            knopf = (f'<form method="post" action="/wifi/delete" style="margin:0" '
+                     f'onsubmit="return confirm(\'Gespeichertes WLAN wirklich löschen?\')">'
+                     f'<input type="hidden" name="uuid" value="{html.escape(uuid)}">'
+                     f'<button type="submit" class="btn-danger btn-small" title="Löschen">🗑</button></form>')
+        zeilen.append(f'<div style="display:flex; align-items:center; justify-content:space-between; '
+                      f'gap:.5rem; padding:.4rem 0; border-bottom:1px solid var(--muted);">'
+                      f'<span>{html.escape(name)}</span>{knopf}</div>')
+    return ('<h2>💾 Gespeicherte WLANs</h2>'
+            '<p class="muted small">Die Box verbindet sich automatisch mit einem dieser Netze, '
+            'sobald es in Reichweite ist.</p>' + "".join(zeilen))
 
 
 def disconnect_wifi():
@@ -1779,6 +1878,7 @@ def render_form(request_host=None, message=""):
         status=status_banner(),
         message=message,
         disconnect_form=DISCONNECT_FORM if connected else "",
+        saved_profiles=render_saved_profiles(),
     )
 
 
@@ -4521,7 +4621,7 @@ class BaseHandler(BaseHTTPRequestHandler):
             self._send_json({"started": True})
             return
 
-        if path in ("/wifi/connect", "/wifi/disconnect") and not IS_PI:
+        if path in ("/wifi/connect", "/wifi/disconnect", "/wifi/delete") and not IS_PI:
             self._not_found()
             return
         if path == "/wifi/disconnect":
@@ -4541,14 +4641,31 @@ class BaseHandler(BaseHTTPRequestHandler):
                 self._send_html(render_form(
                     self.headers.get("Host"), '<div class="msg err">Bitte eine SSID auswaehlen oder eingeben.</div>'))
                 return
-            CONN_STATE.update(done=False, ok=None, detail=None)
+            CONN_STATE.update(done=False, ok=None, detail=None, saved=False, ssid=ssid)
             self._send_html(PAGE_CONNECTING.format(ssid=html.escape(ssid)))
             ok, detail = connect_wifi(ssid, password)
-            CONN_STATE.update(done=True, ok=ok, detail=None if ok else detail)
+            saved = False
             if ok:
                 print(f"WLAN-Verbindung zu '{ssid}' erfolgreich.", file=sys.stderr)
             else:
                 print(f"WLAN-Verbindung zu '{ssid}' fehlgeschlagen: {detail}", file=sys.stderr)
+                # Zugangsdaten trotzdem behalten (Box fuer ein anderes WLAN
+                # vorbereiten, das gerade nicht in Reichweite ist).
+                saved, save_detail = save_wifi_profile(ssid, password)
+                if saved:
+                    print(f"WLAN-Profil '{ssid}' fuer spaeter gespeichert.", file=sys.stderr)
+                else:
+                    detail += f" – Speichern ebenfalls fehlgeschlagen: {save_detail}"
+                    print(f"WLAN-Profil '{ssid}' nicht gespeichert: {save_detail}", file=sys.stderr)
+            CONN_STATE.update(done=True, ok=ok, detail=None if ok else detail, saved=saved)
+            return
+        if path == "/wifi/delete":
+            length = int(self.headers.get("Content-Length", 0))
+            fields = parse_qs(self.rfile.read(length).decode("utf-8"))
+            ok, detail = delete_wifi_profile(fields.get("uuid", [""])[0])
+            msg = (f'<div class="msg ok">🗑 „{html.escape(detail)}“ gelöscht.</div>' if ok
+                   else f'<div class="msg err">Löschen fehlgeschlagen: {html.escape(detail)}</div>')
+            self._send_html(render_form(self.headers.get("Host"), msg))
             return
         self._not_found()
 
